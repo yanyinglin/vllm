@@ -369,6 +369,9 @@ class MQLLMEngine:
     def reset_prefix_cache(self) -> bool:
         return self.engine.reset_prefix_cache()
 
+    async def set_max_num_seqs(self, new_max: int):
+        return await self._request("SET_MAX_NUM_SEQS", new_max)
+
 
 def signal_handler(*_) -> None:
     raise KeyboardInterrupt("MQLLMEngine terminated")

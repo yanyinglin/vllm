@@ -131,7 +131,7 @@ if __name__ == "__main__":
 
     torch.distributed.init_process_group(
         backend='gloo',
-        init_method='tcp://localhost:12398',
+        init_method='tcp://10.233.95.100:14579',
         world_size=2,
         rank=my_rank,
     )
@@ -143,8 +143,8 @@ if __name__ == "__main__":
         kv_rank=my_rank,
         kv_role="kv_both",  # this arg doesn't matter in this test
         kv_parallel_size=2,
-        kv_ip="127.0.0.1",
-        kv_port=12345,
+        kv_ip="10.233.95.100",
+        kv_port=14580,
     )
 
     pipe = PyNcclPipe(

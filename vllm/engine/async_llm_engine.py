@@ -1189,6 +1189,9 @@ class AsyncLLMEngine(EngineClient):
 
     async def add_lora(self, lora_request: LoRARequest) -> None:
         self.engine.add_lora(lora_request)
+    
+    async def set_max_num_seqs(self, new_max: int):
+        self.engine.set_max_num_seqs(new_max)
 
 
 # TODO(v1): Remove this class proxy when V1 goes default.

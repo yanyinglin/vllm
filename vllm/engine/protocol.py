@@ -282,3 +282,7 @@ class EngineClient(ABC):
     async def add_lora(self, lora_request: LoRARequest) -> None:
         """Load a new LoRA adapter into the engine for future requests."""
         ...
+
+    @abstractmethod
+    async def set_max_num_seqs(self, new_max: int) -> None:
+        pass

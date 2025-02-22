@@ -2023,3 +2023,10 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+        
+    def set_max_num_seqs(self, new_max: int):
+        with self._lock:
+            self.scheduler_config.max_num_seqs = new_max
+            # 可能需要重建scheduler
+            self.scheduler = Scheduler(self.scheduler_config, self.cache_config)
