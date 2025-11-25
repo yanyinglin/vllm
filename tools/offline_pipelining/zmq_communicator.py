@@ -244,7 +244,7 @@ class ZeroMQCommunicator:
                 
                 # 反序列化tensor
                 buffer = io.BytesIO(tensor_bytes)
-                tensor = torch.load(buffer, map_location=self.device, weights_only=True)
+                tensor = torch.load(buffer, map_location="cpu", weights_only=True)
                 tensor_list.append(tensor)
             
             # 重建tensor字典
@@ -258,11 +258,33 @@ class ZeroMQCommunicator:
                         raise RuntimeError(f"Not enough tensors: expected at least {tensor_idx + 1}")
                     
                     tensor = tensor_list[tensor_idx]
-                    # 确保tensor在正确的设备上
+                    
+                    # CRITICAL: Ensure dtype matches metadata
+                    # torch.save/load should preserve dtype, but when loading to CPU,
+                    # some dtypes (like float16) might be converted to float32.
+                    # We must restore the original dtype from metadata.
+                    if tensor.dtype != value.dtype:
+                        logger.debug(
+                            f"Stage {self.stage_idx}: Tensor {key} dtype mismatch: "
+                            f"loaded {tensor.dtype}, expected {value.dtype}. Converting..."
+                        )
+                        tensor = tensor.to(dtype=value.dtype)
+                    
+                    # 确保tensor在正确的设备上（先转换dtype，再移动设备）
+                    # 注意：对于 float16/bfloat16，CPU 可能不支持，但 CUDA 支持
                     if self.device.startswith("cuda"):
-                        tensor = tensor.to(self.device)
+                        tensor = tensor.to(dtype=value.dtype, device=self.device)
                     elif self.device == "cpu":
-                        tensor = tensor.cpu()
+                        # CPU 上，float16 可能需要转换为 float32，但我们应该保持原始 dtype
+                        # 如果原始 dtype 是 float16/bfloat16，保持它（即使 CPU 可能不支持某些操作）
+                        tensor = tensor.to(dtype=value.dtype, device="cpu")
+                    
+                    # 最终验证 dtype
+                    if tensor.dtype != value.dtype:
+                        logger.error(
+                            f"Stage {self.stage_idx}: Failed to restore dtype for {key}: "
+                            f"got {tensor.dtype}, expected {value.dtype}"
+                        )
                     
                     tensor_dict[key] = tensor
                     tensor_idx += 1

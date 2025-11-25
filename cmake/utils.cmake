@@ -25,13 +25,26 @@ endmacro()
 # python, a fatal message `ERR_MSG` is issued.
 #
 function (run_python OUT EXPR ERR_MSG)
-  execute_process(
-    COMMAND
-    "${Python_EXECUTABLE}" "-c" "${EXPR}"
-    OUTPUT_VARIABLE PYTHON_OUT
-    RESULT_VARIABLE PYTHON_ERROR_CODE
-    ERROR_VARIABLE PYTHON_STDERR
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  # Prepare environment variables - use CMAKE_COMMAND -E env for consistency
+  if(DEFINED VLLM_PYTHON_PATH)
+    # Use VLLM_PYTHON_PATH if it's set, prepending to existing PYTHONPATH
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env
+        PYTHONPATH=${VLLM_PYTHON_PATH}:$ENV{PYTHONPATH}
+        "${Python_EXECUTABLE}" "-c" "${EXPR}"
+      OUTPUT_VARIABLE PYTHON_OUT
+      RESULT_VARIABLE PYTHON_ERROR_CODE
+      ERROR_VARIABLE PYTHON_STDERR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+  else()
+    execute_process(
+      COMMAND
+      "${Python_EXECUTABLE}" "-c" "${EXPR}"
+      OUTPUT_VARIABLE PYTHON_OUT
+      RESULT_VARIABLE PYTHON_ERROR_CODE
+      ERROR_VARIABLE PYTHON_STDERR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+  endif()
 
   if(NOT PYTHON_ERROR_CODE EQUAL 0)
     message(FATAL_ERROR "${ERR_MSG}: ${PYTHON_STDERR}")

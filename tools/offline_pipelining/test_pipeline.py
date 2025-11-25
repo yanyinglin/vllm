@@ -173,8 +173,16 @@ class PipelineStage:
             except Exception as e:
                 logger.warning(f"Failed to load tokenizer: {e}")
 
-    def forward(self, inputs, position_ids=None, attention_mask=None):
-        """前向传播"""
+    def forward(self, inputs, position_ids=None, attention_mask=None, past_key_values=None, use_cache=True):
+        """前向传播
+        
+        Args:
+            inputs: 输入（可以是tensor或dict）
+            position_ids: position IDs
+            attention_mask: attention mask
+            past_key_values: 之前的KV cache（用于自回归生成）
+            use_cache: 是否使用和返回KV cache
+        """
         if self.model is None:
             raise RuntimeError(f"Stage {self.stage_idx} not loaded")
 
@@ -201,19 +209,24 @@ class PipelineStage:
                         inputs_embeds=hidden_states,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
-                        use_cache=False,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
                     )
                     
-                    # 提取hidden states
+                    # 提取hidden states和past_key_values
                     if hasattr(outputs, "last_hidden_state"):
                         hidden_states = outputs.last_hidden_state
+                        new_past_key_values = getattr(outputs, "past_key_values", None)
                     elif isinstance(outputs, tuple):
+                        # outputs可能是 (hidden_states, past_key_values) 或 (hidden_states,)
                         hidden_states = outputs[0]
+                        new_past_key_values = outputs[1] if len(outputs) > 1 and use_cache else None
                     else:
                         hidden_states = outputs
+                        new_past_key_values = None
                 except Exception as e:
                     logger.error(f"Stage {self.stage_idx} model forward failed: {e}")
-                    # 回退到手动调用layers
+                    # 回退到手动调用layers（不支持KV cache）
                     if hasattr(self.model.model, "layers"):
                         layers = self.model.model.layers
                     elif hasattr(self.model.model, "h"):
@@ -230,6 +243,7 @@ class PipelineStage:
                             position_ids=position_ids,
                         )
                         hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+                    new_past_key_values = None
                 
                 # 如果是最后stage，还需要通过norm和lm_head
                 if self.stage_idx == self.num_stages - 1:
@@ -239,8 +253,13 @@ class PipelineStage:
                     # 通过lm_head
                     if hasattr(self.model, "lm_head"):
                         logits = self.model.lm_head(hidden_states)
+                        if use_cache and new_past_key_values is not None:
+                            return logits, new_past_key_values
                         return logits
                 
+                # 返回hidden states和past_key_values（如果使用cache）
+                if use_cache and new_past_key_values is not None:
+                    return hidden_states, new_past_key_values
                 return hidden_states
             else:
                 # 输入是input_ids - 第一阶段
@@ -257,6 +276,11 @@ class PipelineStage:
                     forward_kwargs["attention_mask"] = attention_mask
                 elif "attention_mask" in inputs:
                     forward_kwargs["attention_mask"] = inputs["attention_mask"]
+                
+                # 支持past_key_values（用于自回归生成）
+                if past_key_values is not None:
+                    forward_kwargs["past_key_values"] = past_key_values
+                forward_kwargs["use_cache"] = use_cache
                 
                 # 调用模型forward，但只获取hidden_states
                 # 使用output_hidden_states=True来获取中间hidden states
@@ -277,7 +301,7 @@ class PipelineStage:
                     else:
                         raise RuntimeError("Stage 0: No embed_tokens found")
                     
-                    # 通过layers
+                    # 通过layers（不支持KV cache的回退路径）
                     layers = None
                     if hasattr(self.model.model, "layers"):
                         layers = self.model.model.layers
@@ -303,7 +327,17 @@ class PipelineStage:
                     for layer in layers:
                         layer_output = layer(hidden_states, position_ids=position_ids, attention_mask=attention_mask)
                         hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+                    # 手动提取路径不支持KV cache
+                    new_past_key_values = None
+                    # 返回hidden states（不使用cache）
+                    return hidden_states
                 
+                # 提取past_key_values（如果使用cache）
+                new_past_key_values = getattr(outputs, "past_key_values", None)
+                
+                # 返回hidden states和past_key_values（如果使用cache）
+                if use_cache and new_past_key_values is not None:
+                    return hidden_states, new_past_key_values
                 return hidden_states
 
 
@@ -588,7 +622,10 @@ def stage_worker_process(
                 inputs = stage.tokenizer(input_text, return_tensors="pt", padding=True)
                 inputs = {k: v.to(stage_device) for k, v in inputs.items()}
                 
+                # 保存初始的input_ids，用于后续的自回归生成
+                initial_input_ids = inputs["input_ids"].clone()
                 seq_length = inputs["input_ids"].shape[1]
+                
                 position_ids = torch.arange(seq_length, dtype=torch.long, device=stage_device).unsqueeze(0)
                 attention_mask = inputs.get("attention_mask", torch.ones(
                     (inputs["input_ids"].shape[0], seq_length),
@@ -596,46 +633,79 @@ def stage_worker_process(
                     device=stage_device
                 ))
                 
-                # Forward
-                hidden_states = stage.forward(inputs, position_ids=position_ids, attention_mask=attention_mask)
+                # Forward（初始prompt，不使用KV cache）
+                forward_result = stage.forward(inputs, position_ids=position_ids, attention_mask=attention_mask, use_cache=True)
+                if isinstance(forward_result, tuple):
+                    hidden_states, past_key_values = forward_result
+                else:
+                    hidden_states = forward_result
+                    past_key_values = None
                 
                 # 使用ZeroMQ通信器发送tensor dict
                 tensor_dict = {"hidden_states": hidden_states}
                 communicator.send_tensor_dict(tensor_dict)
                 logger.info(f"Stage {stage_idx} sent initial hidden states to next stage")
                 
-                # 处理自回归生成：等待接收token ID，处理并发送新的hidden states
+                # 处理自回归生成：使用KV cache避免重新计算所有tokens
+                generation_step = 0
                 while True:
                     token_id = communicator.recv_token_id()
                     if token_id is None:
                         # 超时或错误，退出
-                        logger.info(f"Stage {stage_idx} no more tokens to process")
+                        logger.info(f"Stage {stage_idx} no more tokens to process (generation complete)")
                         break
                     
-                    logger.info(f"Stage {stage_idx} received token ID {token_id} for next iteration")
+                    generation_step += 1
+                    logger.info(f"Stage {stage_idx} received token ID {token_id} for generation step {generation_step}")
+                    print(f"[Stage {stage_idx}] Processing token {token_id} for generation step {generation_step} (position {seq_length})", file=sys.stderr, flush=True)
                     
-                    # 将token ID转换为tensor并处理
-                    token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=stage_device)
-                    
-                    # 创建position_ids和attention_mask（单个token）
+                    # 使用KV cache：只处理新token，使用之前的past_key_values
+                    new_token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=stage_device)
                     new_position_ids = torch.tensor([[seq_length]], dtype=torch.long, device=stage_device)
                     new_attention_mask = torch.ones((1, 1), dtype=torch.bool, device=stage_device)
                     
-                    # 通过stage 0的forward处理新token
-                    # 这会通过embedding和stage 0的layers（如果有）
-                    new_inputs = {"input_ids": token_tensor}
-                    new_hidden_state = stage.forward(
+                    # 通过stage 0的forward处理新token（使用KV cache）
+                    new_inputs = {"input_ids": new_token_tensor}
+                    forward_result = stage.forward(
                         new_inputs,
                         position_ids=new_position_ids,
-                        attention_mask=new_attention_mask
+                        attention_mask=new_attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True
                     )
                     
-                    # 发送新的hidden state（单个token，已通过stage 0的layers）
-                    new_tensor_dict = {"hidden_states": new_hidden_state}
-                    communicator.send_tensor_dict(new_tensor_dict)
-                    logger.info(f"Stage {stage_idx} sent new hidden state for token {token_id}")
+                    if isinstance(forward_result, tuple):
+                        new_hidden_states, past_key_values = forward_result
+                    else:
+                        new_hidden_states = forward_result
+                        # 如果没有返回past_key_values，说明KV cache不可用，回退到重新计算所有tokens
+                        logger.warning(f"Stage {stage_idx} KV cache not available, falling back to full recomputation")
+                        updated_input_ids = torch.cat([initial_input_ids, new_token_tensor], dim=1)
+                        seq_length = updated_input_ids.shape[1]
+                        new_position_ids = torch.arange(seq_length, dtype=torch.long, device=stage_device).unsqueeze(0)
+                        new_attention_mask = torch.ones((1, seq_length), dtype=torch.bool, device=stage_device)
+                        new_inputs = {"input_ids": updated_input_ids}
+                        new_hidden_states = stage.forward(
+                            new_inputs,
+                            position_ids=new_position_ids,
+                            attention_mask=new_attention_mask,
+                            use_cache=False
+                        )
+                        new_hidden_states = new_hidden_states[:, -1:, :]
+                        initial_input_ids = updated_input_ids
+                    
+                    # 确保hidden state的形状正确 [1, 1, hidden_size]
+                    if new_hidden_states.shape[1] != 1:
+                        new_hidden_states = new_hidden_states[:, -1:, :]
+                    
+                    print(f"[Stage {stage_idx}] Generated hidden state for token {token_id} (shape: {new_hidden_states.shape})", file=sys.stderr, flush=True)
                     
                     seq_length += 1
+                    
+                    # 发送新的hidden state（单个token，已通过stage 0的layers）
+                    new_tensor_dict = {"hidden_states": new_hidden_states}
+                    communicator.send_tensor_dict(new_tensor_dict)
+                    logger.info(f"Stage {stage_idx} sent new hidden state for token {token_id} (step {generation_step})")
                     
             except Exception as e:
                 if "Empty" not in str(e):  # 忽略队列超时
@@ -668,66 +738,115 @@ def stage_worker_process(
                 
                 # 生成token序列
                 generated_tokens = []
-                current_hidden_states = hidden_states
                 
-                print(f"[Stage {stage_idx}] Starting generation loop (max_new_tokens={max_new_tokens})...", file=sys.stderr, flush=True)
+                # 处理初始hidden states（来自prompt）
+                print(f"[Stage {stage_idx}] Processing initial hidden states (shape: {hidden_states.shape})...", file=sys.stderr, flush=True)
+                forward_result = stage.forward(hidden_states, use_cache=False)
+                # 处理返回值（可能是tuple或单个tensor）
+                if isinstance(forward_result, tuple):
+                    logits = forward_result[0]
+                else:
+                    logits = forward_result
                 
-                for step in range(max_new_tokens):
-                    # Forward
-                    logits = stage.forward(current_hidden_states)
-                    
-                    # 解码 - 确保正确提取logits
-                    if hasattr(logits, "shape"):
-                        if len(logits.shape) == 3:
-                            # Shape: [batch_size, seq_len, vocab_size]
-                            next_token_logits = logits[0, -1, :]  # 取最后一个token的logits
-                        elif len(logits.shape) == 2:
-                            # Shape: [seq_len, vocab_size] or [batch_size, vocab_size]
-                            if logits.shape[0] > logits.shape[1]:
-                                # 可能是 [seq_len, vocab_size]
-                                next_token_logits = logits[-1, :]
-                            else:
-                                # 可能是 [batch_size, vocab_size]，取第一个（或最后一个）
-                                next_token_logits = logits[0, :] if logits.shape[0] == 1 else logits[-1, :]
+                # 解码 - 确保正确提取logits（取最后一个token的logits）
+                if hasattr(logits, "shape"):
+                    if len(logits.shape) == 3:
+                        # Shape: [batch_size, seq_len, vocab_size]
+                        next_token_logits = logits[0, -1, :]  # 取最后一个token的logits
+                    elif len(logits.shape) == 2:
+                        # Shape: [seq_len, vocab_size] or [batch_size, vocab_size]
+                        if logits.shape[0] > logits.shape[1]:
+                            # 可能是 [seq_len, vocab_size]
+                            next_token_logits = logits[-1, :]
                         else:
-                            # 1D or other shape
-                            next_token_logits = logits.flatten()
+                            # 可能是 [batch_size, vocab_size]
+                            next_token_logits = logits[0, :] if logits.shape[0] == 1 else logits[-1, :]
                     else:
-                        next_token_logits = logits
+                        # 1D or other shape
+                        next_token_logits = logits.flatten()
+                else:
+                    next_token_logits = logits
+                
+                # 获取第一个生成的token ID
+                next_token_id = torch.argmax(next_token_logits, dim=-1)
+                if isinstance(next_token_id, torch.Tensor):
+                    next_token_id = next_token_id.item()
+                
+                generated_tokens.append(next_token_id)
+                print(f"[Stage {stage_idx}] Generated first token: {next_token_id}", file=sys.stderr, flush=True)
+                
+                # 检查是否遇到EOS token
+                if tokenizer.eos_token_id is not None and next_token_id == tokenizer.eos_token_id:
+                    print(f"[Stage {stage_idx}] Generated EOS token at first step, stopping generation", file=sys.stderr, flush=True)
+                else:
+                    # 自回归生成循环：每个新token都需要通过整个pipeline
+                    print(f"[Stage {stage_idx}] Starting autoregressive generation loop (max_new_tokens={max_new_tokens})...", file=sys.stderr, flush=True)
                     
-                    # 获取下一个token ID
-                    next_token_id = torch.argmax(next_token_logits, dim=-1)
-                    if isinstance(next_token_id, torch.Tensor):
-                        next_token_id = next_token_id.item()
-                    
-                    generated_tokens.append(next_token_id)
-                    
-                    # 检查是否遇到EOS token
-                    if tokenizer.eos_token_id is not None and next_token_id == tokenizer.eos_token_id:
-                        print(f"[Stage {stage_idx}] Generated EOS token at step {step+1}, stopping generation", file=sys.stderr, flush=True)
-                        break
-                    
-                    if (step + 1) % 10 == 0:
-                        print(f"[Stage {stage_idx}] Generated {step+1}/{max_new_tokens} tokens", file=sys.stderr, flush=True)
-                    
-                    # 对于下一个token，需要将新token通过整个pipeline
-                    # 将token ID发送回stage 0，stage 0会通过embedding得到新的hidden state
-                    # 然后通过所有stages，最后stage会再次生成下一个token
-                    if step < max_new_tokens - 1:  # 最后一个token不需要继续生成
+                    for step in range(1, max_new_tokens):
+                        # 将token ID发送回stage 0，stage 0会通过embedding得到新的hidden state
+                        # 然后通过所有stages，最后stage会再次生成下一个token
                         communicator.send_token_id(next_token_id)
-                        logger.debug(f"Stage {stage_idx} sent token ID {next_token_id} back to stage 0 (step {step+1})")
+                        logger.debug(f"Stage {stage_idx} sent token ID {next_token_id} back to stage 0 (step {step})")
                         
                         # 等待接收新的hidden states（从stage 0通过所有stages传递过来）
                         # 注意：这里接收的是单个token的hidden state，shape应该是 [1, 1, hidden_size]
                         try:
                             new_tensor_dict = communicator.recv_tensor_dict()
                             if new_tensor_dict is None:
-                                logger.error(f"Stage {stage_idx} failed to receive new hidden states at step {step+1}")
+                                logger.error(f"Stage {stage_idx} failed to receive new hidden states at step {step}")
                                 break
-                            current_hidden_states = new_tensor_dict["hidden_states"]
-                            logger.debug(f"Stage {stage_idx} received new hidden states for token {step+2} (shape: {current_hidden_states.shape})")
+                            
+                            new_hidden_states = new_tensor_dict["hidden_states"]
+                            print(f"[Stage {stage_idx}] Received new hidden states for step {step+1} (shape: {new_hidden_states.shape})", file=sys.stderr, flush=True)
+                            logger.debug(f"Stage {stage_idx} received new hidden states for token {step+1} (shape: {new_hidden_states.shape})")
+                            
+                            # Forward：处理单个token的hidden state（最后stage不使用KV cache）
+                            forward_result = stage.forward(new_hidden_states, use_cache=False)
+                            # 处理返回值（可能是tuple或单个tensor）
+                            if isinstance(forward_result, tuple):
+                                logits = forward_result[0]
+                            else:
+                                logits = forward_result
+                            
+                            # 解码 - 确保正确提取logits
+                            if hasattr(logits, "shape"):
+                                if len(logits.shape) == 3:
+                                    # Shape: [batch_size, seq_len, vocab_size]
+                                    next_token_logits = logits[0, -1, :]  # 取最后一个token的logits
+                                elif len(logits.shape) == 2:
+                                    # Shape: [seq_len, vocab_size] or [batch_size, vocab_size]
+                                    if logits.shape[0] > logits.shape[1]:
+                                        # 可能是 [seq_len, vocab_size]
+                                        next_token_logits = logits[-1, :]
+                                    else:
+                                        # 可能是 [batch_size, vocab_size]
+                                        next_token_logits = logits[0, :] if logits.shape[0] == 1 else logits[-1, :]
+                                else:
+                                    # 1D or other shape
+                                    next_token_logits = logits.flatten()
+                            else:
+                                next_token_logits = logits
+                            
+                            # 获取下一个token ID
+                            next_token_id = torch.argmax(next_token_logits, dim=-1)
+                            if isinstance(next_token_id, torch.Tensor):
+                                next_token_id = next_token_id.item()
+                            
+                            generated_tokens.append(next_token_id)
+                            print(f"[Stage {stage_idx}] Generated token {step+1}: {next_token_id}", file=sys.stderr, flush=True)
+                            
+                            # 检查是否遇到EOS token
+                            if tokenizer.eos_token_id is not None and next_token_id == tokenizer.eos_token_id:
+                                print(f"[Stage {stage_idx}] Generated EOS token at step {step+1}, stopping generation", file=sys.stderr, flush=True)
+                                break
+                            
+                            if (step + 1) % 10 == 0:
+                                print(f"[Stage {stage_idx}] Generated {step+1}/{max_new_tokens} tokens", file=sys.stderr, flush=True)
+                                
                         except Exception as e:
-                            logger.error(f"Stage {stage_idx} error receiving hidden states at step {step+1}: {e}", exc_info=True)
+                            logger.error(f"Stage {stage_idx} error in autoregressive loop at step {step}: {e}", exc_info=True)
+                            import traceback
+                            traceback.print_exc()
                             break
                 
                 # 解码所有生成的tokens
@@ -764,8 +883,13 @@ def stage_worker_process(
                 print(f"[Stage {stage_idx}] Received initial hidden states (shape: {hidden_states.shape})", file=sys.stderr, flush=True)
                 logger.info(f"Stage {stage_idx} received initial hidden states")
                 
-                # Forward
-                hidden_states = stage.forward(hidden_states)
+                # Forward（中间stages不使用KV cache）
+                forward_result = stage.forward(hidden_states, use_cache=False)
+                # 处理返回值（可能是tuple或单个tensor）
+                if isinstance(forward_result, tuple):
+                    hidden_states = forward_result[0]
+                else:
+                    hidden_states = forward_result
                 
                 # 发送到下一个stage
                 output_tensor_dict = {"hidden_states": hidden_states}
@@ -781,18 +905,30 @@ def stage_worker_process(
                         tensor_dict = communicator.recv_tensor_dict()
                         if tensor_dict is None:
                             # 超时或错误，退出循环
-                            logger.info(f"Stage {stage_idx} no more hidden states to process (timeout or error)")
+                            logger.info(f"Stage {stage_idx} no more hidden states to process (timeout or error, step {generation_step})")
                             break
                         
                         hidden_states = tensor_dict["hidden_states"]
+                        print(f"[Stage {stage_idx}] Received hidden states for step {generation_step} (shape: {hidden_states.shape})", file=sys.stderr, flush=True)
                         logger.debug(f"Stage {stage_idx} received hidden states (shape: {hidden_states.shape}, step {generation_step})")
                         
-                        # Forward
-                        hidden_states = stage.forward(hidden_states)
+                        # Forward：处理hidden states（中间stages不使用KV cache）
+                        forward_result = stage.forward(hidden_states, use_cache=False)
+                        # 处理返回值（可能是tuple或单个tensor）
+                        if isinstance(forward_result, tuple):
+                            hidden_states = forward_result[0]
+                        else:
+                            hidden_states = forward_result
+                        
+                        # 确保输出形状正确（如果是单个token输入，输出也应该是单个token）
+                        if tensor_dict["hidden_states"].shape[1] == 1 and hidden_states.shape[1] != 1:
+                            # 如果输入是单个token但输出不是，取最后一个
+                            hidden_states = hidden_states[:, -1:, :]
                         
                         # 发送到下一个stage
                         output_tensor_dict = {"hidden_states": hidden_states}
                         communicator.send_tensor_dict(output_tensor_dict)
+                        print(f"[Stage {stage_idx}] Sent hidden states to next stage (step {generation_step}, shape: {hidden_states.shape})", file=sys.stderr, flush=True)
                         logger.debug(f"Stage {stage_idx} sent hidden states to next stage (step {generation_step})")
                         
                         generation_step += 1
@@ -800,10 +936,12 @@ def stage_worker_process(
                         # 检查是否是ZeroMQ超时错误
                         error_str = str(e)
                         if "timeout" in error_str.lower() or "Again" in error_str:
-                            logger.info(f"Stage {stage_idx} receive timeout, assuming generation complete")
+                            logger.info(f"Stage {stage_idx} receive timeout, assuming generation complete (step {generation_step})")
                             break
                         else:
-                            logger.error(f"Stage {stage_idx} error in generation loop: {e}", exc_info=True)
+                            logger.error(f"Stage {stage_idx} error in generation loop (step {generation_step}): {e}", exc_info=True)
+                            import traceback
+                            traceback.print_exc()
                             break
                 
             except Exception as e:
