@@ -384,6 +384,13 @@ class EngineArgs:
     ) = ParallelConfig.distributed_executor_backend
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    pipeline_stage_mode: Literal["internal", "external"] = ParallelConfig.pipeline_stage_mode
+    pipeline_stage_idx: int | None = ParallelConfig.pipeline_stage_idx
+    pipeline_total_stages: int | None = ParallelConfig.pipeline_total_stages
+    pipeline_layer_range: str | None = ParallelConfig.pipeline_layer_range
+    pipeline_next_stage_addr: str | None = ParallelConfig.pipeline_next_stage_addr
+    pipeline_prev_stage_addr: str | None = ParallelConfig.pipeline_prev_stage_addr
+    pipeline_local_listen_port: int | None = ParallelConfig.pipeline_local_listen_port
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -753,6 +760,48 @@ class EngineArgs:
             "--pipeline-parallel-size",
             "-pp",
             **parallel_kwargs["pipeline_parallel_size"],
+        )
+        parallel_group.add_argument(
+            "--pipeline-stage-mode",
+            choices=["internal", "external"],
+            default="internal",
+            help="Pipeline stage running mode: 'internal' (traditional) or 'external' (single stage mode)",
+        )
+        parallel_group.add_argument(
+            "--pipeline-stage-idx",
+            type=int,
+            default=None,
+            help="Current stage index (0-based) for external mode",
+        )
+        parallel_group.add_argument(
+            "--pipeline-total-stages",
+            type=int,
+            default=None,
+            help="Total number of stages for external mode (optional if layer-range is specified)",
+        )
+        parallel_group.add_argument(
+            "--pipeline-layer-range",
+            type=str,
+            default=None,
+            help="Layer range for current stage in format 'start-end' or '[start-end]', e.g., '0-8'",
+        )
+        parallel_group.add_argument(
+            "--pipeline-next-stage-addr",
+            type=str,
+            default=None,
+            help="Address of next stage in 'ip:port' format for external mode",
+        )
+        parallel_group.add_argument(
+            "--pipeline-prev-stage-addr",
+            type=str,
+            default=None,
+            help="Address of previous stage in 'ip:port' format for external mode (optional)",
+        )
+        parallel_group.add_argument(
+            "--pipeline-local-listen-port",
+            type=int,
+            default=None,
+            help="Local port to bind for receiving data from previous stage in external mode",
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
@@ -1612,6 +1661,18 @@ class EngineArgs:
             model_config.skip_tokenizer_init = True
             logger.info("Skipping tokenizer initialization for tokens-only mode.")
 
+        # In external pipeline mode, non-first stages don't need tokenizer
+        if (
+            self.pipeline_stage_mode == "external"
+            and self.pipeline_stage_idx is not None
+            and self.pipeline_stage_idx > 0
+            and not model_config.skip_tokenizer_init
+        ):
+            model_config.skip_tokenizer_init = True
+            logger.info(
+                f"Skipping tokenizer initialization for external pipeline stage {self.pipeline_stage_idx}."
+            )
+
         # Forward the deprecated CLI args to the EPLB config.
         if self.num_redundant_experts is not None:
             self.eplb_config.num_redundant_experts = self.num_redundant_experts
@@ -1624,6 +1685,13 @@ class EngineArgs:
 
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
+            pipeline_stage_mode=self.pipeline_stage_mode,
+            pipeline_stage_idx=self.pipeline_stage_idx,
+            pipeline_total_stages=self.pipeline_total_stages,
+            pipeline_layer_range=self.pipeline_layer_range,
+            pipeline_next_stage_addr=self.pipeline_next_stage_addr,
+            pipeline_prev_stage_addr=self.pipeline_prev_stage_addr,
+            pipeline_local_listen_port=self.pipeline_local_listen_port,
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,

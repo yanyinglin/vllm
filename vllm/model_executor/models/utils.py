@@ -645,10 +645,25 @@ def make_layers(
     """
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
+    from vllm.config import get_current_vllm_config
 
-    start_layer, end_layer = get_pp_indices(
-        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
-    )
+    # In external mode, use ModelConfig.get_layers_start_end_indices to support
+    # manual layer range specification
+    config = get_current_vllm_config()
+    if (
+        config is not None
+        and config.parallel_config.pipeline_stage_mode == "external"
+    ):
+        start_layer, end_layer = config.model_config.get_layers_start_end_indices(
+            config.parallel_config
+        )
+    else:
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers,
+            get_pp_group().rank_in_group,
+            get_pp_group().world_size,
+        )
+
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [

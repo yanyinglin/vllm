@@ -262,6 +262,15 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "documentation for more details.",
     )
     parser.add_argument(
+        "--external-pp-worker",
+        action="store_true",
+        default=False,
+        help=(
+            "Run as an external pipeline-parallel worker (no HTTP API). "
+            "Requires --pipeline-stage-mode external and --pipeline-stage-idx > 0."
+        ),
+    )
+    parser.add_argument(
         "--api-server-count",
         "-asc",
         type=int,
@@ -293,6 +302,18 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
+
+    # Basic validation for external pipeline worker mode.
+    if getattr(args, "external_pp_worker", False):
+        if args.pipeline_stage_mode != "external":
+            raise ValueError(
+                "--external-pp-worker requires --pipeline-stage-mode external"
+            )
+        if args.pipeline_stage_idx is None or args.pipeline_stage_idx <= 0:
+            raise ValueError(
+                "--external-pp-worker requires --pipeline-stage-idx > 0 "
+                "for non-zero pipeline stages"
+            )
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:

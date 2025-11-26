@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import signal
 
 import uvloop
@@ -10,6 +11,7 @@ import vllm
 import vllm.envs as envs
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.api_server import (
+    build_async_engine_client,
     run_server,
     run_server_worker,
     setup_server,
@@ -50,7 +52,9 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        if args.headless or args.api_server_count < 1:
+        if getattr(args, "external_pp_worker", False):
+            run_external_pp_worker(args)
+        elif args.headless or args.api_server_count < 1:
             run_headless(args)
         else:
             if args.api_server_count > 1:
@@ -76,6 +80,46 @@ class ServeSubcommand(CLISubcommand):
 
 def cmd_init() -> list[CLISubcommand]:
     return [ServeSubcommand()]
+
+
+def run_external_pp_worker(args: argparse.Namespace):
+    """Run a minimal external PP worker: AsyncLLM + EngineCore, no HTTP server.
+
+    This keeps the standard engine lifecycle (including ZeroMQ-based
+    pipeline-parallel communication inside the model executor) but does
+    not start FastAPI/Uvicorn. It is intended for stages with
+    pipeline_stage_mode=\"external\" and pipeline_stage_idx > 0.
+    """
+
+    async def _main() -> None:
+        usage_context = UsageContext.OPENAI_API_SERVER
+
+        async with build_async_engine_client(
+            args,
+            usage_context=usage_context,
+            disable_frontend_multiprocessing=bool(
+                getattr(args, "disable_frontend_multiprocessing", False)
+            ),
+        ) as engine_client:
+            # Simple health check: ensure engine initialized successfully.
+            await engine_client.check_health()
+
+            stage_idx = getattr(args, "pipeline_stage_idx", None)
+            logger.info(
+                "External PP worker started for pipeline stage %s. "
+                "Waiting for shutdown (Ctrl+C / SIGTERM)...",
+                stage_idx,
+            )
+
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except (KeyboardInterrupt, SystemExit):
+                logger.info("External PP worker received shutdown signal.")
+
+    set_process_title("ExternalPPWorker")
+    decorate_logs()
+    uvloop.run(_main())
 
 
 def run_headless(args: argparse.Namespace):

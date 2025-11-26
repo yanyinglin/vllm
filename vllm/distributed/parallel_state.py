@@ -303,6 +303,8 @@ class GroupCoordinator:
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
     mq_broadcaster: Any | None  # shared memory broadcaster
+    # ZeroMQ communicator for external pipeline stage mode
+    zeromq_comm: Any | None = None
 
     def __init__(
         self,
@@ -806,6 +808,11 @@ class GroupCoordinator:
             dictionary allows overriding the default behavior on a per-tensor
             basis.
         """
+        # Use ZeroMQ if available (external mode)
+        if self.zeromq_comm is not None:
+            self.zeromq_comm.send_tensor_dict(tensor_dict, dst)
+            return None
+        
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return tensor_dict
@@ -893,6 +900,10 @@ class GroupCoordinator:
             dictionary allows overriding the default behavior on a per-tensor
             basis.
         """
+        # Use ZeroMQ if available (external mode)
+        if self.zeromq_comm is not None:
+            return self.zeromq_comm.recv_tensor_dict(src)
+        
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
@@ -1066,6 +1077,132 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )
+
+
+def init_external_pp_group(
+    stage_idx: int,
+    num_stages: int,
+    local_rank: int,
+    local_listen_port: int | None = None,
+    next_stage_addr: str | None = None,
+    prev_stage_addr: str | None = None,
+    device: str = "cuda",
+) -> GroupCoordinator:
+    """Initialize PP group for external stage mode using ZeroMQ.
+    
+    This creates a special PP group that uses ZeroMQ for communication
+    instead of PyTorch distributed. Each stage runs as an independent
+    vLLM instance.
+    
+    Args:
+        stage_idx: Current stage index (0-based)
+        num_stages: Total number of stages
+        local_rank: Local rank for device assignment
+        local_listen_port: Local port to bind for receiving data
+        next_stage_addr: Address of next stage in "ip:port" format
+        prev_stage_addr: Address of previous stage in "ip:port" format
+        device: Target device (e.g., "cuda", "cpu")
+    
+    Returns:
+        GroupCoordinator configured for external mode
+    """
+    from vllm.distributed.device_communicators.zeromq_communicator import (
+        ZeroMQPPCommunicator,
+    )
+    
+    # In external mode, each stage is an independent process.
+    # PP communication uses ZeroMQ, not PyTorch distributed.
+    # We create a minimal coordinator that doesn't rely on PyTorch distributed for PP.
+    
+    # Create a minimal GroupCoordinator-like object for external mode
+    class ExternalPPGroupCoordinator:
+        """Minimal PP group coordinator for external mode without PyTorch distributed."""
+        
+        def __init__(self, stage_idx, num_stages, local_rank, device):
+            self.rank = 0  # Dummy rank
+            self.ranks = list(range(num_stages))
+            self.world_size = num_stages
+            self.local_rank = local_rank
+            self.rank_in_group = stage_idx
+            self.device = torch.device(device)
+            self.first_rank = 0
+            self.last_rank = num_stages - 1
+            self.is_first_rank = stage_idx == 0
+            self.is_last_rank = stage_idx == num_stages - 1
+            self.zeromq_comm = None
+            self.unique_name = "pp_external"
+            self.cpu_group = None
+            self.device_group = None
+            self.device_communicator = None
+            self.mq_broadcaster = None
+            self.use_device_communicator = False
+            self.use_custom_op_call = False
+            self.use_cpu_custom_send_recv = False
+        
+        def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+            # No special communication buffer is needed for external ZeroMQ PP.
+            # Keep this as a no-op to satisfy the GroupCoordinator interface.
+            return
+        
+        @contextmanager
+        def graph_capture(
+            self, graph_capture_context: "GraphCaptureContext | None" = None
+        ):
+            # External ZeroMQ PP does not participate in CUDA graph capture.
+            # Just yield the context (or a dummy one) without any side effects.
+            if graph_capture_context is None:
+                yield GraphCaptureContext(torch.cuda.current_stream())
+            else:
+                yield graph_capture_context
+        
+        def send_tensor_dict(self, tensor_dict, dst=None, **kwargs):
+            if self.zeromq_comm is not None:
+                self.zeromq_comm.send_tensor_dict(tensor_dict, dst)
+                return None
+            raise RuntimeError("ZeroMQ communicator not initialized")
+        
+        def recv_tensor_dict(self, src=None, **kwargs):
+            if self.zeromq_comm is not None:
+                return self.zeromq_comm.recv_tensor_dict(src)
+            raise RuntimeError("ZeroMQ communicator not initialized")
+        
+        def destroy(self):
+            if self.zeromq_comm is not None:
+                self.zeromq_comm.close()
+        
+        def barrier(self):
+            # No-op for external mode
+            pass
+    
+    pp_group = ExternalPPGroupCoordinator(stage_idx, num_stages, local_rank, device)
+    
+    # Override rank_in_group and world_size for external mode
+    pp_group.rank_in_group = stage_idx
+    pp_group.world_size = num_stages
+    pp_group.ranks = list(range(num_stages))
+    pp_group.first_rank = 0
+    pp_group.last_rank = num_stages - 1
+    pp_group.is_first_rank = stage_idx == 0
+    pp_group.is_last_rank = stage_idx == num_stages - 1
+    
+    # Initialize ZeroMQ communicator
+    zeromq_comm = ZeroMQPPCommunicator(
+        stage_idx=stage_idx,
+        num_stages=num_stages,
+        local_listen_port=local_listen_port,
+        next_stage_addr=next_stage_addr,
+        prev_stage_addr=prev_stage_addr,
+        device=device,
+    )
+    pp_group.zeromq_comm = zeromq_comm
+    
+    logger.info(
+        f"Initialized external PP group: stage_idx={stage_idx}, "
+        f"num_stages={num_stages}, is_first={stage_idx == 0}, "
+        f"is_last={stage_idx == num_stages - 1}"
+    )
+    
+    return pp_group
 
 
 _TP: GroupCoordinator | None = None
@@ -1389,13 +1526,55 @@ def initialize_model_parallel(
     # Build the pipeline model-parallel groups.
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
-    )
+    
+    # Check if we're in external mode
+    from vllm.config import get_current_vllm_config
+    config = get_current_vllm_config()
+    if (
+        config is not None
+        and config.parallel_config.pipeline_stage_mode == "external"
+    ):
+        # External mode: use ZeroMQ for PP communication
+        parallel_config = config.parallel_config
+        stage_idx = parallel_config.pipeline_stage_idx
+        num_stages = parallel_config.pipeline_total_stages
+        
+        if stage_idx is None:
+            raise ValueError(
+                "pipeline_stage_idx must be set in external mode"
+            )
+        if num_stages is None and parallel_config.pipeline_layer_range is None:
+            raise ValueError(
+                "Either pipeline_total_stages or pipeline_layer_range must be set in external mode"
+            )
+        if num_stages is None:
+            # If layer_range is specified, we can infer num_stages from it
+            # For now, we'll require num_stages to be set
+            raise ValueError(
+                "pipeline_total_stages must be set in external mode"
+            )
+        
+        # Get device from world group
+        device = "cuda" if get_world_group().device.type.startswith("cuda") else "cpu"
+        
+        _PP = init_external_pp_group(
+            stage_idx=stage_idx,
+            num_stages=num_stages,
+            local_rank=get_world_group().local_rank,
+            local_listen_port=parallel_config.pipeline_local_listen_port,
+            next_stage_addr=parallel_config.pipeline_next_stage_addr,
+            prev_stage_addr=parallel_config.pipeline_prev_stage_addr,
+            device=device,
+        )
+    else:
+        # Internal mode: traditional PyTorch distributed
+        group_ranks = (
+            all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
+        )
+        group_ranks = [x.tolist() for x in group_ranks]
+        _PP = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend, group_name="pp"
+        )
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"

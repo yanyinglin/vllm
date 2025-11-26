@@ -269,6 +269,8 @@ def extract_stage_weights(
                 logger.debug(f"Stage {pp_rank}: Extracted lm_head: {key}")
     else:
         logger.debug(f"Stage {pp_rank} is not last stage, skipping lm_head and final norm")
+        # Non-last stages should NOT have lm_head or final norm weights
+        # This is expected behavior for pipeline stages
 
     # 4. 检查遗漏的关键权重
     missing_critical = []
@@ -312,9 +314,8 @@ def create_stage_config(
     # 修改层数
     stage_config["num_hidden_layers"] = end_layer - start_layer
 
-    # 保存dtype信息
+    # 保存dtype信息 (使用dtype代替已弃用的torch_dtype)
     dtype_str = str(torch_dtype).replace("torch.", "")
-    stage_config["torch_dtype"] = dtype_str
     stage_config["dtype"] = dtype_str
 
     # 添加pipeline元数据
@@ -347,6 +348,13 @@ def create_stage_config(
         if "_name_or_path" in stage_config:
             # Don't modify name to avoid confusion
             pass
+        
+        # 设置vocab_size为0或None来阻止lm_head初始化（HuggingFace会检查这个）
+        # 但保留原始值在_pipeline_info中，因为其他部分可能需要它
+        if "vocab_size" in stage_config:
+            stage_config["_original_vocab_size"] = stage_config["vocab_size"]
+            # 不能设置为0，因为embedding层需要它。改为添加标记让加载器忽略lm_head警告
+            stage_config["_pipeline_no_lm_head"] = True
 
     # 非最后stage：移除final norm configuration
     if not is_last_rank:
@@ -467,7 +475,7 @@ def detect_model_dtype(config: PretrainedConfig) -> torch.dtype:
     config_dtype = getattr(config, "torch_dtype", None)
     if config_dtype is None:
         config_dtype = getattr(config, "dtype", None)
-    
+
     if config_dtype is not None:
         if isinstance(config_dtype, str):
             dtype_map = {
@@ -478,17 +486,40 @@ def detect_model_dtype(config: PretrainedConfig) -> torch.dtype:
                 "bf16": torch.bfloat16,
                 "fp32": torch.float32,
             }
-            return dtype_map.get(config_dtype.lower(), torch.float16)
+            detected_dtype = dtype_map.get(config_dtype.lower(), torch.float16)
+            logger.info(f"Detected dtype from config {config_dtype} -> {detected_dtype}")
+            return detected_dtype
         elif isinstance(config_dtype, torch.dtype):
+            logger.info(f"Detected dtype directly from config: {config_dtype}")
             return config_dtype
-    
-    # 2. 检查是否有 fp16/bf16 相关字段
+
+    # 2. 尝试从模型架构推断（常见模型默认精度）
+    model_type = getattr(config, "model_type", "").lower()
+    if model_type:
+        # Llama models typically use bfloat16, but for better compatibility use float16 as default
+        if "llama" in model_type:
+            logger.info("Model type detected as Llama, defaulting to float16 for compatibility")
+            return torch.float16
+        # GPT and similar models often use float16
+        elif any(name in model_type for name in ["gpt", "bloom", "mpt"]):
+            logger.info(f"Model type {model_type} detected, defaulting to float16")
+            return torch.float16
+
+    # 3. 检查是否有 fp16/bf16 相关字段
     if getattr(config, "fp16", False) or getattr(config, "half_precision", False):
+        logger.info("fp16/half_precision flag detected, using float16")
         return torch.float16
     if getattr(config, "bf16", False):
+        logger.info("bf16 flag detected, using bfloat16")
         return torch.bfloat16
-    
-    # 3. 默认使用 float16（大多数LLM使用）
+
+    # 4. 检查是否明确指定为fp32
+    if hasattr(config, 'torch_dtype') and str(config.torch_dtype) == "<class 'torch.float32'>":
+        logger.info("Explicit torch.float32 detected in config")
+        return torch.float32
+
+    # 5. 默认使用 float16（大多数LLM使用）
+    logger.info("Using default dtype: float16")
     return torch.float16
 
 
@@ -577,13 +608,13 @@ def export_pipeline(
         "low_cpu_mem_usage": True,
     }
     
-    # 明确指定torch_dtype
+    # 明确指定dtype (使用dtype代替已弃用的torch_dtype)
     if torch_dtype == torch.float16:
-        load_kwargs["torch_dtype"] = torch.float16
+        load_kwargs["dtype"] = torch.float16
     elif torch_dtype == torch.bfloat16:
-        load_kwargs["torch_dtype"] = torch.bfloat16
+        load_kwargs["dtype"] = torch.bfloat16
     elif torch_dtype == torch.float32:
-        load_kwargs["torch_dtype"] = torch.float32
+        load_kwargs["dtype"] = torch.float32
     
     # 优先使用GPU
     if use_gpu:

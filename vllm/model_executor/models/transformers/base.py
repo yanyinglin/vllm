@@ -235,6 +235,13 @@ class Base(nn.Module, VllmModel, SupportsQuant, SupportsLoRA, SupportsPP):
             setattr(self.model, name, PPMissingLayer())
 
         # Module list
+        # In external mode, use ModelConfig.get_layers_start_end_indices to support
+        # manual layer range specification
+        if self.parallel_config.pipeline_stage_mode == "external":
+            start_layer, end_layer = self.model_config.get_layers_start_end_indices(
+                self.parallel_config
+            )
+        else:
         start_layer, end_layer = get_pp_indices(
             self.text_config.num_hidden_layers,
             self.pp_group.rank_in_group,

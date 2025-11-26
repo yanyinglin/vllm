@@ -1375,15 +1375,55 @@ class ModelConfig:
     ) -> tuple[int, int]:
         from vllm.distributed.utils import get_pp_indices
 
-        total_num_hidden_layers = self.get_total_num_hidden_layers()
+        if parallel_config.pipeline_stage_mode == "external":
+            # External mode: single stage mode
+            if parallel_config.pipeline_layer_range is not None:
+                # If layer_range is specified, parse and use it directly
+                import re
+                layer_range = parallel_config.pipeline_layer_range.strip()
+                # Support formats: "0-8" or "[0-8]"
+                match = re.match(r'\[?(\d+)-(\d+)\]?', layer_range)
+                if not match:
+                    raise ValueError(
+                        f"Invalid pipeline_layer_range format: {layer_range}. "
+                        "Expected 'start-end' or '[start-end]'"
+                    )
+                start = int(match.group(1))
+                end = int(match.group(2))
+                if start >= end:
+                    raise ValueError(
+                        f"Invalid layer range: start ({start}) must be less than end ({end})"
+                    )
+                # Validate against total layers
+                total_num_hidden_layers = self.get_total_num_hidden_layers()
+                if end > total_num_hidden_layers:
+                    raise ValueError(
+                        f"Layer range end ({end}) exceeds total layers ({total_num_hidden_layers})"
+                    )
+                return start, end
+            else:
+                # If layer_range is not specified, use automatic calculation
+                pp_rank = parallel_config.pipeline_stage_idx
+                pp_size = parallel_config.pipeline_total_stages
+                if pp_rank is None or pp_size is None:
+                    raise ValueError(
+                        "Either pipeline_layer_range or (pipeline_stage_idx and "
+                        "pipeline_total_stages) must be set in external mode"
+                    )
+                total_num_hidden_layers = self.get_total_num_hidden_layers()
+                start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+                return start, end
+        else:
+            # Internal mode: traditional mode
+            total_num_hidden_layers = self.get_total_num_hidden_layers()
 
-        # the layout order is: DP x PP x TP
-        pp_rank = (
-            parallel_config.rank // parallel_config.tensor_parallel_size
-        ) % parallel_config.pipeline_parallel_size
-        pp_size = parallel_config.pipeline_parallel_size
-        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
-        return start, end
+            # the layout order is: DP x PP x TP
+            pp_rank = (
+                parallel_config.rank // parallel_config.tensor_parallel_size
+            ) % parallel_config.pipeline_parallel_size
+            pp_size = parallel_config.pipeline_parallel_size
+            start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+            return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:
         start, end = self.get_layers_start_end_indices(parallel_config)

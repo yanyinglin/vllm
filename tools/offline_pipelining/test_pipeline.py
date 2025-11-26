@@ -122,7 +122,7 @@ class PipelineStage:
             self.model = AutoModelForCausalLM.from_config(
                 config,
                 trust_remote_code=True,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,  # 使用dtype代替已弃用的torch_dtype
             )
             
             # 3. 手动加载权重文件

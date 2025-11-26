@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-vLLM Engine-based Pipeline Test with ZeroMQ
-
-Patched version: enhanced debug and robust forward_context initialization.
+Optimized vLLM Engine-based Pipeline Test with ZeroMQ
+Fixed issues: position encoding, KV cache management, attention context
 """
-
 import argparse
 import multiprocessing
 import os
@@ -13,10 +11,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional, Union, Any, Dict
-
+from typing import Optional, Union, Any, Dict, List
 import torch
-
 from vllm.engine.arg_utils import EngineArgs
 from vllm.distributed.parallel_state import get_pp_group, initialize_model_parallel, init_distributed_environment
 from vllm.entrypoints.llm import LLM
@@ -25,7 +21,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.utils import PPMissingLayer
 from transformers import AutoTokenizer
-
 # Import zmq_communicator
 try:
     from .zmq_communicator import ZeroMQCommunicator
@@ -36,200 +31,9 @@ except ImportError:
     if str(current_dir) not in sys.path:
         sys.path.insert(0, str(current_dir))
     from zmq_communicator import ZeroMQCommunicator
-
 logger = init_logger(__name__)
-
 # Global ZeroMQ communicator for each stage process
 _zmq_communicator: Optional[ZeroMQCommunicator] = None
-
-# ----------------- DEBUG PATCH: better attention context failure traces -----------------
-# Patch get_attention_context to print available keys on KeyError for quick debugging.
-try:
-    import vllm.attention.layer as _vllm_attn_layer
-    if hasattr(_vllm_attn_layer, 'get_attention_context'):
-        _orig_get_attention_context = _vllm_attn_layer.get_attention_context
-        
-        def _debug_get_attention_context(layer_name: str):
-            from vllm.forward_context import get_forward_context
-            try:
-                return _orig_get_attention_context(layer_name)
-            except KeyError as e:
-                # Best-effort introspection of forward_context
-                try:
-                    ctx = get_forward_context()
-                    # ctx may expose no_compile_layers or similar structure
-                    keys = []
-                    if hasattr(ctx, 'no_compile_layers'):
-                        keys = list(ctx.no_compile_layers.keys())
-                    elif hasattr(ctx, 'keys'):
-                        keys = list(ctx.keys())
-                    print('\n========== ATTENTION CONTEXT DEBUG ==========', flush=True, file=sys.stderr)
-                    print(f'Requested layer_name: {layer_name}', flush=True, file=sys.stderr)
-                    print(f'Available keys ({len(keys)}):', flush=True, file=sys.stderr)
-                    for k in keys:
-                        print(f'  - {k}', flush=True, file=sys.stderr)
-                    print('=============================================\n', flush=True, file=sys.stderr)
-                except AssertionError:
-                    print('\n[DEBUG] get_forward_context() not set; cannot introspect forward context.\n', flush=True, file=sys.stderr)
-                except Exception as ex:
-                    print(f'\n[DEBUG] Failed to introspect forward context: {ex}\n', flush=True, file=sys.stderr)
-                raise
-        
-        _vllm_attn_layer.get_attention_context = _debug_get_attention_context
-        print('[DEBUG] Patched vllm.attention.layer.get_attention_context for debug', flush=True)
-except Exception:
-    # If import fails, continue without patching
-    print('[DEBUG] Could not patch get_attention_context (import failure)', flush=True)
-
-
-
-def _register_stage_attention_layers(
-    model,
-    vllm_config,
-    stage_start_layer: int,
-    stage_end_layer: int | None = None,
-    global_layer_map: Dict[int, int] | None = None,
-) -> list[str]:
-    """Register attention layers into static_forward_context + robust global-index discovery.
-
-    Strategy:
-      1. If global_layer_map is provided, use it directly (preferred, from serve_pipeline.py).
-      2. Otherwise, build a mapping from module object id -> its named_modules() name (if available).
-      3. For each entry in model.layers (the local list), try to find the real global index
-         by looking up the module object in that mapping and extracting 'layers.<N>' from the name.
-      4. If extraction fails, fallback to stage_start_layer + local_idx (legacy behavior).
-    """
-    forward_context = vllm_config.compilation_config.static_forward_context
-
-    print(f"[DEBUG] register_stage_attention_layers: start={stage_start_layer}, end={stage_end_layer}", flush=True)
-
-    # Clear stale keys (best-effort)
-    try:
-        stale_keys = [k for k in forward_context.keys() if k.startswith("model.layers.")]
-    except Exception:
-        if hasattr(forward_context, "no_compile_layers"):
-            stale_keys = [k for k in forward_context.no_compile_layers.keys() if k.startswith("model.layers.")]
-        else:
-            stale_keys = []
-    for k in stale_keys:
-        try:
-            forward_context.pop(k, None)
-        except Exception:
-            try:
-                if hasattr(forward_context, "no_compile_layers"):
-                    forward_context.no_compile_layers.pop(k, None)
-            except Exception:
-                pass
-
-    base_model = model.model if hasattr(model, "model") else model
-    layers = getattr(base_model, "layers", None)
-    if layers is None:
-        print("[DEBUG] No layers found in model", flush=True)
-        return []
-
-    # Build object-id -> name map from model.named_modules()
-    obj_to_name = {}
-    try:
-        for name, mod in base_model.named_modules():
-            obj_to_name[id(mod)] = name
-    except Exception:
-        # If named_modules isn't available or errors, leave map empty (we'll fallback)
-        obj_to_name = {}
-
-    registered_names: list[str] = []
-
-    for local_idx, layer_module in enumerate(layers):
-        # compute a fallback global idx
-        fallback_global_idx = stage_start_layer + local_idx
-
-        # Get mod_name for debug output (always try to get it)
-        mod_name = obj_to_name.get(id(layer_module), None)
-
-        # Priority 1: Use global_layer_map if provided (from serve_pipeline.py)
-        if global_layer_map is not None and local_idx in global_layer_map:
-            global_idx = global_layer_map[local_idx]
-            discovered_idx = global_idx  # For debug output
-        else:
-            # Priority 2: try to discover name from obj map
-            discovered_idx = None
-            if mod_name:
-                # try to parse 'layers.<N>' or '.h.<N>' or similar
-                parts = mod_name.split(".")
-                for i, p in enumerate(parts):
-                    if p in ("layers", "h") and i + 1 < len(parts):
-                        try:
-                            discovered_idx = int(parts[i + 1])
-                            break
-                        except Exception:
-                            continue
-                    # sometimes name like 'transformer.h.2'
-                    if p == "transformer" and i + 1 < len(parts):
-                        try:
-                            discovered_idx = int(parts[i + 1])
-                            break
-                        except Exception:
-                            continue
-
-            if discovered_idx is not None:
-                global_idx = discovered_idx
-            else:
-                # Priority 3: fallback to stage_start_layer + local_idx
-                global_idx = fallback_global_idx
-
-        # if stage_end_layer is provided, respect it
-        if stage_end_layer is not None and global_idx >= stage_end_layer:
-            # If the discovered global idx is out of stage range, skip
-            continue
-
-        # skip PPMissingLayer if present
-        try:
-            from vllm.model_executor.models.utils import PPMissingLayer
-            if isinstance(layer_module, PPMissingLayer):
-                continue
-        except Exception:
-            # ignore if PPMissingLayer is not importable
-            pass
-
-        attn_module = getattr(layer_module, "self_attn", None)
-        if attn_module is None:
-            continue
-
-        attention_layer = getattr(attn_module, "attn", attn_module)
-        layer_name = f"model.layers.{global_idx}.self_attn.attn"
-
-        # write into forward_context robustly
-        try:
-            forward_context[layer_name] = attention_layer
-        except Exception:
-            if hasattr(forward_context, "no_compile_layers"):
-                try:
-                    forward_context.no_compile_layers[layer_name] = attention_layer
-                except Exception:
-                    print(f"[WARNING] Failed to set forward_context entry for {layer_name}", flush=True)
-            else:
-                print(f"[WARNING] forward_context does not accept item assignment; skipping {layer_name}", flush=True)
-
-        registered_names.append(layer_name)
-        print(f"[DEBUG] REGISTER ATTENTION: {layer_name} (local_idx={local_idx}, discovered={discovered_idx}, fallback={fallback_global_idx}, mod_name={mod_name})", flush=True)
-
-    # summary
-    print(f"[DEBUG] Registered {len(registered_names)} attention layers:", flush=True)
-    for name in registered_names:
-        print(f"  - {name}", flush=True)
-
-    # print forward_context keys snapshot
-    try:
-        ctx_keys = list(forward_context.keys())
-    except Exception:
-        if hasattr(forward_context, "no_compile_layers"):
-            ctx_keys = list(forward_context.no_compile_layers.keys())
-        else:
-            ctx_keys = []
-    print(f"[DEBUG] forward_context now has {len(ctx_keys)} keys", flush=True)
-    if len(ctx_keys) < len(registered_names):
-        print("[WARNING] forward_context keys < registered attention count! Something overwrote the mapping?", flush=True)
-
-    return registered_names
 
 
 
@@ -284,6 +88,839 @@ class ZeroMQPPGroup:
     def recv_object(self, src: int | None = None):
         """Not used in ZeroMQ mode"""
         return None
+
+
+# ----------------- Pipeline State Manager -----------------
+class PipelineStateManager:
+    """Manages global state across pipeline stages"""
+    
+    def __init__(self, stage_idx: int, num_stages: int):
+        self.stage_idx = stage_idx
+        self.num_stages = num_stages
+        self.global_seq_len = 0  # Length of the full sequence across all stages
+        self.kv_caches = {}  # {layer_id: (key_cache, value_cache)}
+        self.token_positions = []  # Global token positions for all tokens
+        
+    def update_from_tensor_dict(self, tensor_dict: Dict[str, Any]):
+        """Update state from received tensor dict"""
+        if 'global_seq_len' in tensor_dict:
+            self.global_seq_len = tensor_dict['global_seq_len']
+        if 'token_positions' in tensor_dict:
+            self.token_positions = tensor_dict['token_positions'].tolist()
+        # KV cache updates handled separately in attention layers
+    
+    def prepare_tensor_dict(self, hidden_states, residual, is_decode: bool = False):
+        """Prepare tensor dict with necessary state information"""
+        tensor_dict = {
+            "hidden_states": hidden_states,
+            "residual": residual,
+            "global_seq_len": self.global_seq_len,
+            "is_decode": is_decode,
+        }
+        if self.token_positions:
+            tensor_dict["token_positions"] = torch.tensor(self.token_positions, device=hidden_states.device)
+        return tensor_dict
+    
+    def update_positions(self, current_positions: torch.Tensor, is_initial_prompt: bool = False):
+        """Update global token positions based on current stage's processing"""
+        if is_initial_prompt:
+            # For initial prompt, set token positions from 0 to seq_len-1
+            self.global_seq_len = current_positions.shape[-1]
+            self.token_positions = current_positions.tolist()
+        else:
+            # For decode, append new position
+            new_position = self.global_seq_len
+            self.token_positions.append(new_position)
+            self.global_seq_len += 1
+    
+    def get_current_position(self) -> int:
+        """Get current global position for next token"""
+        return self.global_seq_len
+
+# ----------------- Improved attention context handling -----------------
+def _register_stage_attention_layers(
+    model,
+    vllm_config,
+    stage_start_layer: int,
+    stage_end_layer: int | None = None,
+    global_layer_map: Dict[int, int] | None = None,
+    pipeline_state: PipelineStateManager = None,
+    stage_idx: int | None = None
+) -> list[str]:
+    """Register attention layers into static_forward_context with proper global indexing."""
+    forward_context = vllm_config.compilation_config.static_forward_context
+    # Get stage_idx from pipeline_state if available, otherwise use stage_idx parameter
+    actual_stage_idx = pipeline_state.stage_idx if pipeline_state is not None else (stage_idx if stage_idx is not None else 0)
+    logger.debug(f"[Stage {actual_stage_idx}] Registering attention layers: start={stage_start_layer}, end={stage_end_layer}")
+    
+    # Clear stale keys
+    try:
+        stale_keys = [k for k in forward_context.keys() if k.startswith("model.layers.")]
+    except Exception:
+        if hasattr(forward_context, "no_compile_layers"):
+            stale_keys = [k for k in forward_context.no_compile_layers.keys() if k.startswith("model.layers.")]
+        else:
+            stale_keys = []
+    for k in stale_keys:
+        try:
+            forward_context.pop(k, None)
+        except Exception:
+            try:
+                if hasattr(forward_context, "no_compile_layers"):
+                    forward_context.no_compile_layers.pop(k, None)
+            except Exception:
+                pass
+
+    # Get base model (unwrap if necessary)
+    base_model = model.model if hasattr(model, "model") else model
+    layers = getattr(base_model, "layers", None)
+    if layers is None:
+        logger.warning("[DEBUG] No layers found in model")
+        return []
+
+    registered_names = []
+    attention_layers = {}
+    
+    # Get all relevant layer numbers for this stage
+    layer_indices = range(len(layers))
+    if stage_end_layer is not None:
+        layer_indices = [i for i in layer_indices if i < (stage_end_layer - stage_start_layer)]
+    
+    for local_idx in layer_indices:
+        layer_module = layers[local_idx]
+        
+        # Skip missing layers
+        if isinstance(layer_module, PPMissingLayer):
+            continue
+            
+        # Determine global layer index
+        if global_layer_map is not None and local_idx in global_layer_map:
+            global_idx = global_layer_map[local_idx]
+        else:
+            # Fallback to local index + stage start
+            global_idx = stage_start_layer + local_idx
+        
+        # Get attention module
+        attn_module = getattr(layer_module, "self_attn", None)
+        if attn_module is None:
+            continue
+            
+        attention_layer = getattr(attn_module, "attn", attn_module)
+        
+        # Build proper layer name with global index
+        layer_name = f"model.layers.{global_idx}.self_attn.attn"
+        
+        # Register in forward context
+        try:
+            forward_context[layer_name] = attention_layer
+        except Exception:
+            if hasattr(forward_context, "no_compile_layers"):
+                try:
+                    forward_context.no_compile_layers[layer_name] = attention_layer
+                except Exception as e:
+                    logger.warning(f"Failed to set forward_context entry for {layer_name}: {e}")
+            else:
+                logger.warning(f"forward_context does not accept item assignment; skipping {layer_name}")
+        
+        # Also store in attention_layers dict for easier access later
+        attention_layers[global_idx] = attention_layer
+        registered_names.append(layer_name)
+        logger.debug(f"[Stage {actual_stage_idx}] REGISTER ATTENTION: {layer_name} (local_idx={local_idx}, global_idx={global_idx})")
+    
+    logger.info(f"[Stage {actual_stage_idx}] Registered {len(registered_names)} attention layers")
+    return registered_names, attention_layers
+
+def stage_worker_process(
+    stage_idx: int,
+    pipeline_dir: str,
+    num_stages: int,
+    zmq_ports: list[int],
+    device: str,
+    dist_init_path: str,
+    input_queue: Optional[multiprocessing.Queue],
+    output_queue: Optional[multiprocessing.Queue],
+    max_new_tokens: int = 256,
+):
+    """Optimized stage worker process using vLLM engine with ZeroMQ communication"""
+    import os
+    try:
+        # Set device for this stage
+        if device.startswith("cuda") and torch.cuda.device_count() > 0:
+            gpu_id = stage_idx % torch.cuda.device_count()
+            stage_device = f"cuda:{gpu_id}"
+            torch.cuda.set_device(torch.device(stage_device))
+            logger.info(f"[Stage {stage_idx}] Using GPU device: {stage_device}")
+        else:
+            stage_device = device
+            logger.info(f"[Stage {stage_idx}] Using CPU device")
+        
+        def log_stage(message: str, level="INFO") -> None:
+            formatted = f"[Stage {stage_idx}] {message}"
+            if level == "DEBUG":
+                logger.debug(formatted)
+            elif level == "WARNING":
+                logger.warning(formatted)
+            elif level == "ERROR":
+                logger.error(formatted)
+            else:
+                logger.info(formatted)
+        
+        log_stage(f"Worker process started on {stage_device} (PID: {os.getpid()})")
+        
+        # Initialize pipeline state manager
+        pipeline_state = PipelineStateManager(stage_idx, num_stages)
+        log_stage("Initialized pipeline state manager")
+        
+        # Setup ZeroMQ communicator
+        communicator = ZeroMQCommunicator(
+            stage_idx=stage_idx,
+            num_stages=num_stages,
+            zmq_ports=zmq_ports,
+            device=stage_device,
+            timeout_ms=300000,  # 5 minutes timeout
+        )
+        log_stage("ZeroMQ communicator initialized")
+        
+        # Setup ZeroMQ PP group
+        setup_zeromq_pp_group(stage_idx, num_stages, communicator)
+        log_stage("ZeroMQ PP group patched")
+        
+        # Load stage model
+        stage_dir = Path(pipeline_dir) / f"stage_{stage_idx}"
+        if not stage_dir.exists():
+            raise FileNotFoundError(f"Stage directory not found: {stage_dir}")
+        log_stage(f"Loading model from {stage_dir}")
+        
+        # Load config
+        import json
+        config_path = stage_dir / "config.json"
+        with open(config_path, "r", encoding="utf-8") as f:
+            stage_config = json.load(f)
+        
+        pipeline_info = stage_config.get("_pipeline_info", {})
+        stage_start_layer = pipeline_info.get("start_layer")
+        stage_end_layer = pipeline_info.get("end_layer")
+        global_layer_map = None
+        
+        if "global_layer_map" in pipeline_info:
+            global_layer_map_serializable = pipeline_info["global_layer_map"]
+            global_layer_map = {
+                int(local_idx): global_idx
+                for local_idx, global_idx in global_layer_map_serializable.items()
+            }
+            log_stage(f"Loaded global_layer_map with {len(global_layer_map)} entries")
+        
+        # Determine model dtype
+        dtype_str = stage_config.get("dtype", stage_config.get("torch_dtype", "float16"))
+        model_dtype = "float16" if "float16" in str(dtype_str) else "bfloat16" if "bfloat16" in str(dtype_str) else "float16"
+        
+        # Initialize model components
+        from vllm.config import ModelConfig, VllmConfig, LoadConfig, DeviceConfig, CompilationConfig, CompilationMode, ParallelConfig
+        from vllm.model_executor.model_loader.utils import initialize_model
+        from vllm.config import set_current_vllm_config
+        from vllm.forward_context import set_forward_context, get_forward_context
+        
+        # Create model config
+        model_config = ModelConfig(
+            model=str(stage_dir),
+            dtype=model_dtype,
+            trust_remote_code=True,
+            task=None,
+            tokenizer=str(stage_dir),
+            tokenizer_mode="auto",
+            seed=0,
+            quantization=None,
+        )
+        
+        # Get original number of layers
+        original_num_layers = pipeline_info.get("original_num_hidden_layers", model_config.hf_config.num_hidden_layers)
+        
+        # Create VllmConfig
+        load_config = LoadConfig(load_format="auto", download_dir=None)
+        device_for_config = stage_device if stage_device != "cpu" else "cpu"
+        device_config = DeviceConfig(device=device_for_config)
+        compilation_config = CompilationConfig(mode=CompilationMode.NONE)
+        parallel_config = ParallelConfig(
+            pipeline_parallel_size=num_stages,
+            tensor_parallel_size=1,
+        )
+        vllm_config = VllmConfig(
+            model_config=model_config,
+            load_config=load_config,
+            device_config=device_config,
+            compilation_config=compilation_config,
+            parallel_config=parallel_config,
+        )
+        
+        log_stage(f"Initializing model on device: {stage_device}")
+        
+        # Initialize model
+        with set_current_vllm_config(vllm_config=vllm_config):
+            model = initialize_model(
+                vllm_config=vllm_config,
+                model_config=model_config,
+            )
+        
+        # Load weights directly to target device
+        weights_file = None
+        if (stage_dir / "model.safetensors").exists():
+            weights_file = str(stage_dir / "model.safetensors")
+        elif (stage_dir / "pytorch_model.bin").exists():
+            weights_file = str(stage_dir / "pytorch_model.bin")
+        
+        if weights_file:
+            log_stage(f"Loading weights from {weights_file} to device {stage_device}")
+            target_device = stage_device if stage_device != "cpu" else "cpu"
+            
+            if weights_file.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(weights_file, device=target_device)
+            else:
+                state_dict = torch.load(weights_file, map_location=target_device, weights_only=True)
+            
+            # Convert all weights to target dtype
+            log_stage(f"Converting weights to {model_dtype}...")
+            target_dtype = torch.float16 if model_dtype == "float16" else torch.bfloat16
+            for key, value in state_dict.items():
+                if isinstance(value, torch.Tensor) and value.dtype != target_dtype:
+                    state_dict[key] = value.to(dtype=target_dtype)
+            
+            # Load weights
+            from vllm.model_executor.models.utils import AutoWeightsLoader
+            weights_loader = AutoWeightsLoader(model)
+            weights = [(k, v) for k, v in state_dict.items()]
+            weights_loader.load_weights(weights)
+            log_stage("Weights loaded successfully")
+        
+        # Process weights after loading
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+        target_torch_device = torch.device(stage_device if stage_device != "cpu" else "cpu")
+        process_weights_after_loading(
+            model,
+            model_config,
+            target_torch_device
+        )
+        
+        # Ensure model is on correct device
+        if stage_device != "cpu":
+            model = model.to(stage_device)
+        
+        # Ensure all parameters are in target dtype
+        target_dtype = torch.float16 if model_dtype == "float16" else torch.bfloat16
+        for param in model.parameters():
+            if param.dtype != target_dtype:
+                param.data = param.data.to(dtype=target_dtype)
+        
+        model.eval()
+        log_stage(f"Model initialized on {next(model.parameters()).device} with dtype {target_dtype}")
+        
+        # Register attention layers for this stage
+        registered_names, attention_layers = _register_stage_attention_layers(
+            model=model,
+            vllm_config=vllm_config,
+            stage_start_layer=stage_start_layer or 0,
+            stage_end_layer=stage_end_layer,
+            global_layer_map=global_layer_map,
+            pipeline_state=pipeline_state
+        )
+        
+        # Initialize forward context if not already set
+        try:
+            ctx = get_forward_context()
+            log_stage("Forward context already set")
+        except (AssertionError, RuntimeError):
+            try:
+                set_forward_context(None, vllm_config, num_tokens=1)
+                log_stage("Initialized default forward context")
+            except Exception as ex:
+                log_stage(f"Failed to initialize forward context: {ex}", "WARNING")
+        
+        # Load tokenizer (only first stage)
+        tokenizer = None
+        if stage_idx == 0:
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(stage_dir), trust_remote_code=True
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            log_stage("Tokenizer loaded")
+        
+        # Get model weight dtype for dtype consistency
+        def get_model_weight_dtype(model):
+            if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+                first_layer = model.model.layers[0]
+                if hasattr(first_layer, "self_attn") and hasattr(first_layer.self_attn, "q_proj"):
+                    return first_layer.self_attn.q_proj.weight.dtype
+                elif hasattr(first_layer, "mlp") and hasattr(first_layer.mlp, "gate_proj"):
+                    return first_layer.mlp.gate_proj.weight.dtype
+            return next(model.parameters()).dtype
+        
+        model_weight_dtype = get_model_weight_dtype(model)
+        log_stage(f"Model weight dtype: {model_weight_dtype}")
+        
+        # Patch forward method for pipeline compatibility
+        if hasattr(model, "model") and hasattr(model.model, "forward"):
+            original_forward = model.model.forward
+            
+            def patched_forward(
+                self_model,
+                input_ids=None,
+                positions=None,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+                kv_caches=None,
+                attn_metadata=None,
+                **kwargs
+            ):
+                """Optimized forward pass that correctly handles pipeline stages"""
+                # Determine if this is the first stage (receives input_ids)
+                is_first_stage = (intermediate_tensors is None and (input_ids is not None or inputs_embeds is not None))
+                
+                # Handle input for first stage
+                if is_first_stage:
+                    if inputs_embeds is not None:
+                        hidden_states = inputs_embeds
+                    else:
+                        hidden_states = self_model.embed_tokens(input_ids)
+                    residual = None
+                else:
+                    # Middle or last stage - receive hidden states from previous stage
+                    assert intermediate_tensors is not None
+                    hidden_states = intermediate_tensors.tensors["hidden_states"]
+                    residual = intermediate_tensors.tensors.get("residual", None)
+                
+                # Ensure correct dtype
+                if hidden_states.dtype != model_weight_dtype:
+                    hidden_states = hidden_states.to(dtype=model_weight_dtype)
+                if residual is not None and residual.dtype != model_weight_dtype:
+                    residual = residual.to(dtype=model_weight_dtype)
+                
+                # Process through layers
+                aux_hidden_states = []
+                for idx, layer in enumerate(self_model.layers):
+                    if idx in self_model.aux_hidden_state_layers:
+                        aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+                    
+                    # Process layer with KV cache and attention metadata
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        kv_cache=None,  # KV cache handled by attention layers directly
+                        attn_metadata=attn_metadata
+                    )
+                
+                # Determine if this is the last stage
+                is_last_stage = (stage_idx == num_stages - 1)
+                
+                if not is_last_stage:
+                    # Return intermediate tensors for next stage
+                    return IntermediateTensors({
+                        "hidden_states": hidden_states,
+                        "residual": residual
+                    })
+                
+                # Last stage: apply norm and return final hidden states
+                hidden_states, _ = self_model.norm(hidden_states, residual)
+                
+                if hidden_states.dim() == 3:
+                    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+                
+                if len(aux_hidden_states) > 0:
+                    return hidden_states, aux_hidden_states
+                
+                return hidden_states
+            
+            # Apply the patch
+            import types
+            model.model.forward = types.MethodType(patched_forward, model.model)
+            log_stage("Patched forward method for pipeline compatibility")
+        
+        # Pipeline execution based on stage position
+        is_first_stage = (stage_idx == 0)
+        is_last_stage = (stage_idx == num_stages - 1)
+        
+        try:
+            if is_first_stage:
+                # First stage: process input prompt and start generation
+                log_stage("Waiting for input from queue...")
+                input_text = input_queue.get(timeout=300)
+                if input_text is None:
+                    log_stage("Received exit signal")
+                    return
+                
+                log_stage(f"Received input: {input_text}")
+                
+                # Tokenize input
+                inputs = tokenizer(input_text, return_tensors="pt")
+                input_ids = inputs["input_ids"].to(stage_device)
+                batch_size, seq_length = input_ids.shape
+                pipeline_state.global_seq_len = seq_length
+                
+                # Create position IDs for the prompt
+                positions = torch.arange(seq_length, dtype=torch.long, device=stage_device)
+                pipeline_state.update_positions(positions, is_initial_prompt=True)
+                
+                # Process the prompt through the model
+                log_stage(f"Processing prompt of length {seq_length}...")
+                with set_current_vllm_config(vllm_config=vllm_config):
+                    with set_forward_context(None, vllm_config, num_tokens=seq_length):
+                        output = model(
+                            input_ids=input_ids.flatten(),
+                            positions=positions,
+                            intermediate_tensors=None,
+                        )
+                
+                # Send output to next stage
+                if isinstance(output, IntermediateTensors):
+                    hidden_states = output["hidden_states"]
+                    residual = output.get("residual")
+                    
+                    # Prepare tensor dict with state information
+                    tensor_dict = pipeline_state.prepare_tensor_dict(
+                        hidden_states, residual, is_decode=False
+                    )
+                    
+                    if not is_last_stage:
+                        communicator.send_tensor_dict(tensor_dict)
+                        log_stage(f"Sent initial hidden states to next stage. Global seq len: {pipeline_state.global_seq_len}")
+                
+                # Start generation loop
+                generated_tokens = []
+                for step in range(max_new_tokens):
+                    if step == 0 and not is_last_stage:
+                        # Wait for first token from last stage
+                        token_id = communicator.recv_token_id()
+                        if token_id is None:
+                            break
+                    elif step > 0:
+                        # Receive token from last stage
+                        token_id = communicator.recv_token_id()
+                        if token_id is None:
+                            break
+                    
+                    if step > 0:
+                        generated_tokens.append(token_id)
+                    
+                    # Prepare input for next token
+                    new_token_tensor = torch.tensor([[token_id]], device=stage_device, dtype=torch.long)
+                    current_position = torch.tensor([pipeline_state.get_current_position()], device=stage_device, dtype=torch.long)
+                    
+                    # Update pipeline state
+                    pipeline_state.update_positions(current_position)
+                    
+                    # Process new token
+                    with set_current_vllm_config(vllm_config=vllm_config):
+                        with set_forward_context(None, vllm_config, num_tokens=1):
+                            new_output = model(
+                                input_ids=new_token_tensor.flatten(),
+                                positions=current_position,
+                                intermediate_tensors=None,
+                            )
+                    
+                    # Send to next stage
+                    if isinstance(new_output, IntermediateTensors):
+                        hidden_states = new_output["hidden_states"]
+                        residual = new_output.get("residual")
+                        
+                        # Prepare tensor dict with state information
+                        tensor_dict = pipeline_state.prepare_tensor_dict(
+                            hidden_states, residual, is_decode=True
+                        )
+                        
+                        if not is_last_stage:
+                            communicator.send_tensor_dict(tensor_dict)
+                            log_stage(f"Sent hidden state for token {step+1} with global position {current_position.item()}")
+                    
+                    # Check for EOS token
+                    if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                        log_stage("Generated EOS token, stopping generation")
+                        break
+                
+                # Generation complete
+                communicator.send_token_id(None)  # Signal end of generation
+                log_stage(f"Generation complete. Generated {len(generated_tokens)} tokens")
+            
+            elif is_last_stage:
+                # Last stage: process inputs from previous stage and generate tokens
+                log_stage("Waiting for initial activations...")
+                
+                # Load tokenizer for decoding
+                stage0_dir = Path(pipeline_dir) / "stage_0"
+                tokenizer = AutoTokenizer.from_pretrained(str(stage0_dir), trust_remote_code=True)
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                
+                # Receive initial activations
+                tensor_dict = communicator.recv_tensor_dict()
+                if tensor_dict is None:
+                    raise RuntimeError("Failed to receive initial tensor dict")
+                
+                # Update pipeline state
+                pipeline_state.update_from_tensor_dict(tensor_dict)
+                initial_seq_len = pipeline_state.global_seq_len
+                
+                log_stage(f"Received initial activations. Global seq len: {initial_seq_len}")
+                
+                # Process initial activations
+                hidden_states = tensor_dict["hidden_states"]
+                residual = tensor_dict.get("residual")
+                
+                # Ensure correct dtype
+                if hidden_states.dtype != model_weight_dtype:
+                    hidden_states = hidden_states.to(dtype=model_weight_dtype)
+                if residual is not None and residual.dtype != model_weight_dtype:
+                    residual = residual.to(dtype=model_weight_dtype)
+                
+                # Get positions from tensor dict or create default
+                positions = tensor_dict.get("token_positions")
+                if positions is None:
+                    positions = torch.arange(initial_seq_len, dtype=torch.long, device=hidden_states.device)
+                
+                # Process through model
+                intermediate_tensors = IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
+                
+                with set_current_vllm_config(vllm_config=vllm_config):
+                    with set_forward_context(None, vllm_config, num_tokens=initial_seq_len):
+                        output = model(
+                            input_ids=None,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                        )
+                
+                # Generate first token
+                if hasattr(model, "compute_logits"):
+                    logits = model.compute_logits(output)
+                else:
+                    logits = output
+                
+                # Get the last token's logits
+                if logits.dim() == 3:
+                    next_token_logits = logits[0, -1, :]
+                elif logits.dim() == 2:
+                    next_token_logits = logits[-1, :]
+                else:
+                    next_token_logits = logits
+                
+                next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+                generated_tokens = [next_token_id]
+                log_stage(f"Generated first token: {next_token_id} (text: '{tokenizer.decode([next_token_id], skip_special_tokens=True)}')")
+                
+                # Send first token back to first stage
+                communicator.send_token_id(next_token_id)
+                
+                # Generation loop
+                for step in range(1, max_new_tokens):
+                    # Receive new hidden states from previous stage
+                    new_tensor_dict = communicator.recv_tensor_dict()
+                    if new_tensor_dict is None:
+                        log_stage("No more hidden states received, stopping generation")
+                        break
+                    
+                    # Update pipeline state
+                    pipeline_state.update_from_tensor_dict(new_tensor_dict)
+                    
+                    # Process new hidden states
+                    hidden_states = new_tensor_dict["hidden_states"]
+                    residual = new_tensor_dict.get("residual")
+                    
+                    # Ensure correct dtype
+                    if hidden_states.dtype != model_weight_dtype:
+                        hidden_states = hidden_states.to(dtype=model_weight_dtype)
+                    if residual is not None and residual.dtype != model_weight_dtype:
+                        residual = residual.to(dtype=model_weight_dtype)
+                    
+                    # Get position from tensor dict
+                    current_position = new_tensor_dict.get("token_positions")
+                    if current_position is None:
+                        current_position = torch.tensor([pipeline_state.get_current_position()-1], device=hidden_states.device)
+                    
+                    # Process through model
+                    new_intermediate_tensors = IntermediateTensors({
+                        "hidden_states": hidden_states,
+                        "residual": residual
+                    })
+                    
+                    with set_current_vllm_config(vllm_config=vllm_config):
+                        with set_forward_context(None, vllm_config, num_tokens=1):
+                            new_output = model(
+                                input_ids=None,
+                                positions=current_position,
+                                intermediate_tensors=new_intermediate_tensors,
+                            )
+                    
+                    # Generate next token
+                    if hasattr(model, "compute_logits"):
+                        new_logits = model.compute_logits(new_output)
+                    else:
+                        new_logits = new_output
+                    
+                    # Get the last token's logits
+                    if new_logits.dim() == 3:
+                        next_token_logits = new_logits[0, -1, :]
+                    elif new_logits.dim() == 2:
+                        next_token_logits = new_logits[-1, :]
+                    else:
+                        next_token_logits = new_logits
+                    
+                    next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+                    generated_tokens.append(next_token_id)
+                    
+                    token_text = tokenizer.decode([next_token_id], skip_special_tokens=True)
+                    log_stage(f"Generated token {step+1}: {next_token_id} (text: '{token_text}')")
+                    
+                    # Send token back to first stage
+                    communicator.send_token_id(next_token_id)
+                    
+                    # Check for EOS
+                    if tokenizer.eos_token_id is not None and next_token_id == tokenizer.eos_token_id:
+                        log_stage("Generated EOS token, stopping generation")
+                        break
+                
+                # Decode the generated tokens
+                output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                log_stage(f"Final generated text: '{output_text}'")
+                
+                if output_queue is not None:
+                    output_queue.put(output_text)
+            
+            else:
+                # Middle stages: receive, process, and forward
+                log_stage("Waiting for initial activations...")
+                
+                # Receive initial activations
+                tensor_dict = communicator.recv_tensor_dict()
+                if tensor_dict is None:
+                    raise RuntimeError("Failed to receive initial tensor dict")
+                
+                # Update pipeline state
+                pipeline_state.update_from_tensor_dict(tensor_dict)
+                initial_seq_len = pipeline_state.global_seq_len
+                
+                log_stage(f"Received initial activations. Global seq len: {initial_seq_len}")
+                
+                # Process initial activations
+                hidden_states = tensor_dict["hidden_states"]
+                residual = tensor_dict.get("residual")
+                
+                # Ensure correct dtype
+                if hidden_states.dtype != model_weight_dtype:
+                    hidden_states = hidden_states.to(dtype=model_weight_dtype)
+                if residual is not None and residual.dtype != model_weight_dtype:
+                    residual = residual.to(dtype=model_weight_dtype)
+                
+                # Get positions from tensor dict or create default
+                positions = tensor_dict.get("token_positions")
+                if positions is None:
+                    positions = torch.arange(initial_seq_len, dtype=torch.long, device=hidden_states.device)
+                
+                # Process through model
+                intermediate_tensors = IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
+                
+                with set_current_vllm_config(vllm_config=vllm_config):
+                    with set_forward_context(None, vllm_config, num_tokens=initial_seq_len):
+                        output = model(
+                            input_ids=None,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                        )
+                
+                # Forward to next stage
+                if isinstance(output, IntermediateTensors):
+                    hidden_states_out = output["hidden_states"]
+                    residual_out = output.get("residual")
+                    
+                    # Prepare tensor dict with state information
+                    tensor_dict_out = pipeline_state.prepare_tensor_dict(
+                        hidden_states_out, residual_out, is_decode=False
+                    )
+                    
+                    communicator.send_tensor_dict(tensor_dict_out)
+                    log_stage("Forwarded initial activations to next stage")
+                
+                # Generation loop
+                for step in range(max_new_tokens):
+                    # Receive new hidden states
+                    new_tensor_dict = communicator.recv_tensor_dict()
+                    if new_tensor_dict is None:
+                        log_stage("No more hidden states received, stopping processing")
+                        break
+                    
+                    # Update pipeline state
+                    pipeline_state.update_from_tensor_dict(new_tensor_dict)
+                    
+                    # Process new hidden states
+                    hidden_states = new_tensor_dict["hidden_states"]
+                    residual = new_tensor_dict.get("residual")
+                    
+                    # Ensure correct dtype
+                    if hidden_states.dtype != model_weight_dtype:
+                        hidden_states = hidden_states.to(dtype=model_weight_dtype)
+                    if residual is not None and residual.dtype != model_weight_dtype:
+                        residual = residual.to(dtype=model_weight_dtype)
+                    
+                    # Get position from tensor dict
+                    current_position = new_tensor_dict.get("token_positions")
+                    if current_position is None:
+                        current_position = torch.tensor([pipeline_state.get_current_position()-1], device=hidden_states.device)
+                    
+                    # Process through model
+                    new_intermediate_tensors = IntermediateTensors({
+                        "hidden_states": hidden_states,
+                        "residual": residual
+                    })
+                    
+                    with set_current_vllm_config(vllm_config=vllm_config):
+                        with set_forward_context(None, vllm_config, num_tokens=1):
+                            new_output = model(
+                                input_ids=None,
+                                positions=current_position,
+                                intermediate_tensors=new_intermediate_tensors,
+                            )
+                    
+                    # Forward to next stage
+                    if isinstance(new_output, IntermediateTensors):
+                        hidden_states_out = new_output["hidden_states"]
+                        residual_out = new_output.get("residual")
+                        
+                        # Prepare tensor dict with state information
+                        tensor_dict_out = pipeline_state.prepare_tensor_dict(
+                            hidden_states_out, residual_out, is_decode=True
+                        )
+                        
+                        communicator.send_tensor_dict(tensor_dict_out)
+                        log_stage(f"Forwarded hidden states for generation step {step+1}")
+                
+                log_stage("Middle stage processing complete")
+        
+        except Exception as e:
+            log_stage(f"Error during processing: {str(e)}", "ERROR")
+            import traceback
+            traceback.print_exc()
+            if output_queue is not None and is_last_stage:
+                output_queue.put(f"ERROR: {str(e)}")
+        
+        finally:
+            communicator.close()
+            log_stage("Worker process exiting")
+    
+    except Exception as e:
+        logger.error(f"Stage {stage_idx} fatal error: {e}", exc_info=True)
+        import traceback
+        traceback.print_exc()
+        if output_queue is not None and stage_idx == num_stages - 1:
+            try:
+                output_queue.put(f"ERROR: Stage {stage_idx} failed: {e}")
+            except:
+                pass
+    finally:
+        logger.info(f"Stage {stage_idx} worker process exiting")
 
 
 def setup_zeromq_pp_group(stage_idx: int, num_stages: int, communicator: ZeroMQCommunicator):
@@ -550,10 +1187,16 @@ def stage_worker_process(
                 else:
                     state_dict = torch.load(weights_file, map_location=target_device, weights_only=True)
                 
+                # Convert all weights to fp16
+                log_stage("Converting weights to fp16...")
+                for key, value in state_dict.items():
+                    if isinstance(value, torch.Tensor) and value.dtype != torch.float16:
+                        state_dict[key] = value.to(dtype=torch.float16)
+                
                 weights_loader = AutoWeightsLoader(model)
                 weights = [(k, v) for k, v in state_dict.items()]
                 weights_loader.load_weights(weights)
-                log_stage("Weights loaded")
+                log_stage("Weights loaded in fp16")
             
             # Process weights after loading
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -573,6 +1216,17 @@ def stage_worker_process(
                 if first_param.device.type != "cuda":
                     log_stage(f"WARNING: Model parameters not on CUDA! Moving to {stage_device}")
                     model = model.to(stage_device)
+            
+            # Ensure all parameters are fp16
+            first_param = next(model.parameters())
+            if first_param.dtype != torch.float16:
+                log_stage(f"Converting model parameters to fp16 (current: {first_param.dtype})...")
+                for param in model.parameters():
+                    if param.dtype != torch.float16:
+                        param.data = param.data.to(dtype=torch.float16)
+                log_stage("Model parameters converted to fp16")
+            else:
+                log_stage(f"Model parameters already in fp16")
             
             model.eval()
             stage_vllm_config = vllm_config
@@ -613,6 +1267,7 @@ def stage_worker_process(
                 stage_start_layer=stage_start_layer or 0,
                 stage_end_layer=stage_end_layer,
                 global_layer_map=global_layer_map,
+                stage_idx=stage_idx,
             )
             if not stage_attention_layer_names:
                 log_stage("WARNING: No attention layers registered; kv cache may be unavailable")

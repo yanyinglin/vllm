@@ -69,6 +69,32 @@ class ParallelConfig:
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
+    
+    pipeline_stage_mode: Literal["internal", "external"] = "internal"
+    """Pipeline stage running mode:
+    - "internal": Traditional mode, all stages in the same executor
+    - "external": Single stage mode, each stage is an independent vLLM instance"""
+    
+    pipeline_stage_idx: int | None = None
+    """Current stage index (0-based), only used in external mode"""
+    
+    pipeline_total_stages: int | None = None
+    """Total number of stages, only used in external mode (optional if layer_range is specified)"""
+    
+    pipeline_layer_range: str | None = None
+    """Layer range for current stage in format "start-end" or "[start-end]", e.g., "0-8" or "[0-8]".
+    Only used in external mode. If specified, overrides automatic layer calculation.
+    Embedding layer is fixed in the first stage (stage_idx=0)."""
+    
+    pipeline_next_stage_addr: str | None = None
+    """Address of next stage in "ip:port" format, only used in external mode"""
+    
+    pipeline_prev_stage_addr: str | None = None
+    """Address of previous stage in "ip:port" format, only used in external mode (optional)"""
+    
+    pipeline_local_listen_port: int | None = None
+    """Local port to bind for receiving data from previous stage, only used in external mode"""
+    
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = 1
@@ -329,6 +355,36 @@ class ParallelConfig:
                 "Prefill context parallelism is not fully supported. "
                 "Please set prefill_context_parallel_size to 1."
             )
+        
+        # Validate external mode configuration
+        if self.pipeline_stage_mode == "external":
+            if self.pipeline_stage_idx is None:
+                raise ValueError(
+                    "pipeline_stage_idx must be set when pipeline_stage_mode is 'external'"
+                )
+            if self.pipeline_total_stages is None and self.pipeline_layer_range is None:
+                raise ValueError(
+                    "Either pipeline_total_stages or pipeline_layer_range must be set "
+                    "when pipeline_stage_mode is 'external'"
+                )
+            if self.pipeline_stage_idx < 0:
+                raise ValueError(
+                    f"pipeline_stage_idx must be >= 0, got {self.pipeline_stage_idx}"
+                )
+            if self.pipeline_total_stages is not None:
+                if self.pipeline_total_stages <= 0:
+                    raise ValueError(
+                        f"pipeline_total_stages must be > 0, got {self.pipeline_total_stages}"
+                    )
+                if self.pipeline_stage_idx >= self.pipeline_total_stages:
+                    raise ValueError(
+                        f"pipeline_stage_idx ({self.pipeline_stage_idx}) must be < "
+                        f"pipeline_total_stages ({self.pipeline_total_stages})"
+                    )
+            # In external mode, pipeline_parallel_size should be 1 for world_size calculation
+            # but we keep the original value for compatibility
+            # The actual PP communication uses ZeroMQ, not PyTorch distributed
+        
         return self
 
     @property
@@ -547,8 +603,13 @@ class ParallelConfig:
             )
 
         # Continue with the rest of the initialization
+        # In external mode, each stage is independent, so pipeline_parallel_size
+        # should be treated as 1 for world_size calculation
+        effective_pp_size = (
+            1 if self.pipeline_stage_mode == "external" else self.pipeline_parallel_size
+        )
         self.world_size = (
-            self.pipeline_parallel_size
+            effective_pp_size
             * self.tensor_parallel_size
             * self.prefill_context_parallel_size
         )
