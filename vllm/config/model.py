@@ -1402,7 +1402,31 @@ class ModelConfig:
                     )
                 return start, end
             else:
-                # If layer_range is not specified, use automatic calculation
+                # Check if _pipeline_info exists in config (from pipeline-split model files)
+                # _pipeline_info is a dictionary in config.json, accessed via getattr
+                pipeline_info = getattr(self.hf_config, '_pipeline_info', None)
+                if pipeline_info is not None:
+                    # Model file is from a pipeline-split export
+                    # Use all local layers (local index always starts from 0)
+                    local_num_hidden_layers = self.get_total_num_hidden_layers()
+                    if local_num_hidden_layers <= 0:
+                        raise ValueError(
+                            f"Invalid num_hidden_layers in pipeline-split model: {local_num_hidden_layers}"
+                        )
+                    # In pipeline-split models, layers are stored with local indices 0 to num_hidden_layers-1
+                    # We should use all local layers
+                    # Log for debugging
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        f"External PP stage {parallel_config.pipeline_stage_idx}: "
+                        f"Detected _pipeline_info in config, using all {local_num_hidden_layers} local layers "
+                        f"(range [0, {local_num_hidden_layers}))"
+                    )
+                    return 0, local_num_hidden_layers
+                
+                # If layer_range is not specified and no _pipeline_info, use automatic calculation
+                # This case is for models that haven't been pipeline-split
                 pp_rank = parallel_config.pipeline_stage_idx
                 pp_size = parallel_config.pipeline_total_stages
                 if pp_rank is None or pp_size is None:

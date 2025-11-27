@@ -179,10 +179,10 @@ for stage_idx in $(seq 0 $((NUM_STAGES - 1))); do
     # Disable CUDA graphs to debug pipeline parallelism issues
     # CMD="$CMD --enforce-eager"
     
-    # CRITICAL: Specify the layer range for each stage
-    # Each stage model has 8 layers (local index 0-7), so we use 0-8
-    # This tells vLLM to use all 8 layers in the model file
-    CMD="$CMD --pipeline-layer-range 0-8"
+    # Layer range is now automatically detected from _pipeline_info in config.json
+    # If _pipeline_info exists, vLLM will use all local layers [0, num_hidden_layers)
+    # No need to manually specify --pipeline-layer-range anymore
+    # CMD="$CMD --pipeline-layer-range 0-8"
     
     # Stage 0 exposes HTTP API; later stages run as external PP workers.
     if [ "$IS_FIRST" = "true" ]; then
