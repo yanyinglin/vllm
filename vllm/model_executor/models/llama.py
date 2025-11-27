@@ -563,7 +563,16 @@ class LlamaForCausalLM(
             layer_type=layer_type,
         )
 
-        if get_pp_group().is_last_rank:
+        # In external PP mode, lm_head and logits_processor should be on stage_0 (is_first_rank)
+        # In internal PP mode, they should be on the last rank (is_last_rank)
+        pp_group = get_pp_group()
+        should_have_lm_head = (
+            pp_group.is_first_rank
+            if vllm_config.parallel_config.pipeline_stage_mode == "external"
+            else pp_group.is_last_rank
+        )
+        
+        if should_have_lm_head:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -623,6 +632,12 @@ class LlamaForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if not hasattr(self, "logits_processor") or self.logits_processor is None:
+            raise AttributeError(
+                "logits_processor is not available on this pipeline stage. "
+                "In external PP mode, it should be on stage_0 (is_first_rank). "
+                "In internal PP mode, it should be on the last rank (is_last_rank)."
+            )
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 

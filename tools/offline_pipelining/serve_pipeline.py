@@ -241,7 +241,22 @@ def extract_stage_weights(
                 f"{key} -> {new_key}"
             )
 
-    # 3. 提取norm层和lm_head（仅尾阶段）
+    # 3. 提取lm_head（仅首阶段）
+    if is_first_rank:
+        # 提取lm_head - more specific matching
+        lm_head_key = model_patterns["lm_head_key"]
+        for key in list(full_state_dict.keys()):
+            # More robust matching for lm_head
+            if ("lm_head" in key and "weight" in key) or key == "lm_head.weight":
+                stage_weights[key] = full_state_dict[key].clone()
+                extracted_keys.add(key)
+                logger.debug(f"Stage {pp_rank}: Extracted lm_head: {key}")
+    else:
+        logger.debug(f"Stage {pp_rank} is not first stage, skipping lm_head")
+        # Non-first stages should NOT have lm_head weights
+        # This is expected behavior for pipeline stages (external PP mode)
+
+    # 4. 提取final norm（仅尾阶段）
     if is_last_rank:
         # 提取final norm - more specific regex pattern matching
         norm_key = model_patterns["norm_key"]
@@ -258,28 +273,17 @@ def extract_stage_weights(
                     stage_weights[key] = full_state_dict[key].clone()
                     extracted_keys.add(key)
                     logger.debug(f"Stage {pp_rank}: Extracted final norm: {key}")
-
-        # 提取lm_head - more specific matching
-        lm_head_key = model_patterns["lm_head_key"]
-        for key in list(full_state_dict.keys()):
-            # More robust matching for lm_head
-            if ("lm_head" in key and "weight" in key) or key == "lm_head.weight":
-                stage_weights[key] = full_state_dict[key].clone()
-                extracted_keys.add(key)
-                logger.debug(f"Stage {pp_rank}: Extracted lm_head: {key}")
     else:
-        logger.debug(f"Stage {pp_rank} is not last stage, skipping lm_head and final norm")
-        # Non-last stages should NOT have lm_head or final norm weights
-        # This is expected behavior for pipeline stages
+        logger.debug(f"Stage {pp_rank} is not last stage, skipping final norm")
 
-    # 4. 检查遗漏的关键权重
+    # 5. 检查遗漏的关键权重
     missing_critical = []
     if is_first_rank and not any("embed_tokens.weight" in k or "wte.weight" in k or "word_embeddings.weight" in k for k in stage_weights):
         missing_critical.append("embedding layer")
+    if is_first_rank and not any("lm_head.weight" in k for k in stage_weights):
+        missing_critical.append("lm_head")
     if is_last_rank and not any("norm.weight" in k or "ln_f.weight" in k or "norm_f.weight" in k for k in stage_weights):
         missing_critical.append("final norm")
-    if is_last_rank and not any("lm_head.weight" in k for k in stage_weights):
-        missing_critical.append("lm_head")
 
     if missing_critical:
         logger.warning(
@@ -287,7 +291,7 @@ def extract_stage_weights(
             "This may cause inference failures."
         )
 
-    # 5. 统计报告
+    # 6. 统计报告
     logger.info(
         f"Stage {pp_rank}: Extracted {len(extracted_keys)}/{len(all_original_keys)} keys. "
         f"Global layer map: {len(global_layer_map)} layers"
@@ -333,8 +337,8 @@ def create_stage_config(
     # === 关键修复：根据stage类型移除不必要的配置 ===
     model_type = stage_config.get("model_type", "").lower()
 
-    # 非最后stage：移除lm_head相关配置
-    if not is_last_rank:
+    # 非首stage：移除lm_head相关配置
+    if not is_first_rank:
         # 禁用权重共享（embedding和lm_head共享权重）
         if "tie_word_embeddings" in stage_config:
             stage_config["tie_word_embeddings"] = False
@@ -373,7 +377,7 @@ def create_stage_config(
 
     # 针对Llama的特殊处理
     if "llama" in model_type:
-        if not is_last_rank:
+        if not is_first_rank:
             # Explicitly mark that this Llama stage doesn't have lm_head
             stage_config["_no_lm_head"] = True
         if not is_first_rank:
@@ -752,10 +756,12 @@ def export_pipeline(
                     
                     if is_first and not has_embedding:
                         logger.warning(f"Stage {pp_rank} is first stage but has no embedding weights")
-                    if is_last and not has_lm_head:
-                        logger.warning(f"Stage {pp_rank} is last stage but has no lm_head weights")
-                    if not is_last and has_lm_head:
-                        logger.warning(f"Stage {pp_rank} is not last stage but has lm_head weights")
+                    if is_first and not has_lm_head:
+                        logger.warning(f"Stage {pp_rank} is first stage but has no lm_head weights")
+                    if not is_first and has_lm_head:
+                        logger.warning(f"Stage {pp_rank} is not first stage but has lm_head weights")
+                    if is_last and not any("norm.weight" in k or "ln_f.weight" in k or "norm_f.weight" in k for k in weight_keys):
+                        logger.warning(f"Stage {pp_rank} is last stage but has no final norm weights")
             except Exception as e:
                 logger.warning(f"Failed to verify weights for stage {pp_rank}: {str(e)}")
 

@@ -411,4 +411,7 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
     Returns:
         A memoryview of the tensor data as uint8.
     """
+    # Move CUDA tensors to CPU before converting to numpy
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
     return tensor.flatten().contiguous().view(torch.uint8).numpy().data

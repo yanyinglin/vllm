@@ -236,17 +236,18 @@ class Base(nn.Module, VllmModel, SupportsQuant, SupportsLoRA, SupportsPP):
 
         # Module list
         # In external mode, use ModelConfig.get_layers_start_end_indices to support
-        # manual layer range specification
+        # manual layer range specification. Otherwise, fall back to the standard
+        # PP partitioning based on (pp_rank, pp_world_size).
         if self.parallel_config.pipeline_stage_mode == "external":
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
                 self.parallel_config
             )
         else:
-        start_layer, end_layer = get_pp_indices(
-            self.text_config.num_hidden_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
-        )
+            start_layer, end_layer = get_pp_indices(
+                self.text_config.num_hidden_layers,
+                self.pp_group.rank_in_group,
+                self.pp_group.world_size,
+            )
         layers_name = pp_plan[module_list_idx]
         layers = getattr(self.model, layers_name)
         for i in range(len(layers)):
@@ -256,8 +257,18 @@ class Base(nn.Module, VllmModel, SupportsQuant, SupportsLoRA, SupportsPP):
 
         # Layers after module list
         for name in pp_plan[module_list_idx + 1 :]:
-            # Modules that should be on last rank
-            if not self.pp_group.is_last_rank:
+            # Modules that should be on the \"head\" rank.
+            #
+            # Internal PP mode keeps these only on the last rank so that
+            # lm_head / final norm live there. In external PP mode we instead
+            # keep them on the first rank (stage 0) so that the projection
+            # can be applied after the final stage returns its hidden states.
+            keep_after = (
+                self.pp_group.is_first_rank
+                if self.parallel_config.pipeline_stage_mode == "external"
+                else self.pp_group.is_last_rank
+            )
+            if not keep_after:
                 setattr(self.model, name, PPMissingLayer())
 
     def recursive_replace(self):

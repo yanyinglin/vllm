@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
@@ -63,6 +63,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
+    _current_vllm_config: "VllmConfig | None" = None
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -291,6 +292,18 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides=None,
         )
 
+    def load_model(
+        self, vllm_config: "VllmConfig", model_config: ModelConfig
+    ) -> nn.Module:
+        """Load a model with the given configurations."""
+        # Store vllm_config for use in load_weights
+        self._current_vllm_config = vllm_config
+        try:
+            return super().load_model(vllm_config, model_config)
+        finally:
+            # Clear the stored config after loading
+            self._current_vllm_config = None
+
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
@@ -314,8 +327,57 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            # In external PP mode, stage_0 may not have lm_head.weight in checkpoint
+            # Allow missing lm_head.weight if:
+            # 1. It's tied with embed_tokens (they share the same parameter)
+            # 2. Or in external PP mode, stage_0's checkpoint may not include lm_head
             if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
+                # Check if lm_head.weight is missing and if it's acceptable
+                acceptable_missing = set()
+                if "lm_head.weight" in weights_not_loaded:
+                    # Check if model has lm_head and if it's tied weights
+                    if hasattr(model, "lm_head"):
+                        lm_head = model.lm_head
+                        from vllm.model_executor.models.utils import PPMissingLayer
+                        # Check if it's not PPMissingLayer (has actual lm_head)
+                        if not isinstance(lm_head, PPMissingLayer):
+                            # If lm_head is tied with embed_tokens, it's acceptable
+                            # to not have lm_head.weight in checkpoint
+                            tied_weights = False
+                            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                                # Check if weights are tied (they share the same parameter)
+                                embed_weight = model.model.embed_tokens.weight
+                                if hasattr(lm_head, "weight") and lm_head.weight is embed_weight:
+                                    acceptable_missing.add("lm_head.weight")
+                                    tied_weights = True
+                            
+                            # Also allow in external PP mode if lm_head exists but weight is missing
+                            # (checkpoint may not include it, will be initialized or loaded separately)
+                            if not tied_weights:
+                                # Try to get parallel_config from stored vllm_config or current context
+                                vllm_config = None
+                                if self._current_vllm_config is not None:
+                                    vllm_config = self._current_vllm_config
+                                else:
+                                    try:
+                                        from vllm.config import get_current_vllm_config
+                                        vllm_config = get_current_vllm_config()
+                                    except Exception:
+                                        pass
+                                
+                                if (
+                                    vllm_config is not None
+                                    and vllm_config.parallel_config.pipeline_stage_mode == "external"
+                                    and vllm_config.parallel_config.pipeline_stage_idx == 0
+                                ):
+                                    acceptable_missing.add("lm_head.weight")
+                                    logger.debug(
+                                        "Allowing missing lm_head.weight in external PP mode "
+                                        f"for stage_0 (pipeline_stage_idx={vllm_config.parallel_config.pipeline_stage_idx})"
+                                    )
+                weights_not_loaded = weights_not_loaded - acceptable_missing
+                if weights_not_loaded:
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {weights_not_loaded}"
+                    )

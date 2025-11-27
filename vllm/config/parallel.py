@@ -355,7 +355,7 @@ class ParallelConfig:
                 "Prefill context parallelism is not fully supported. "
                 "Please set prefill_context_parallel_size to 1."
             )
-        
+
         # Validate external mode configuration
         if self.pipeline_stage_mode == "external":
             if self.pipeline_stage_idx is None:
@@ -366,6 +366,25 @@ class ParallelConfig:
                 raise ValueError(
                     "Either pipeline_total_stages or pipeline_layer_range must be set "
                     "when pipeline_stage_mode is 'external'"
+                )
+            # Enforce current limitation: only TP=1, DP=1 are supported.
+            if self.tensor_parallel_size != 1:
+                raise ValueError(
+                    "tensor_parallel_size must be 1 when pipeline_stage_mode is "
+                    "'external'. Tensor parallel external pipeline is not yet "
+                    "supported."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    "data_parallel_size must be 1 when pipeline_stage_mode is "
+                    "'external'. Data parallel external pipeline is not yet "
+                    "supported."
+                )
+            if self.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "pipeline_parallel_size must be 1 when pipeline_stage_mode is "
+                    "'external'. Use pipeline_total_stages to describe the number "
+                    "of external stages instead."
                 )
             if self.pipeline_stage_idx < 0:
                 raise ValueError(
@@ -381,6 +400,43 @@ class ParallelConfig:
                         f"pipeline_stage_idx ({self.pipeline_stage_idx}) must be < "
                         f"pipeline_total_stages ({self.pipeline_total_stages})"
                     )
+            
+            # Validate required addresses/ports for external PP communication
+            is_first = self.pipeline_stage_idx == 0
+            is_last = (
+                self.pipeline_total_stages is not None
+                and self.pipeline_stage_idx == self.pipeline_total_stages - 1
+            )
+            
+            # Non-first stages need a local listen port to receive from previous stage
+            if not is_first and self.pipeline_local_listen_port is None:
+                raise ValueError(
+                    f"pipeline_local_listen_port must be set for stage {self.pipeline_stage_idx} "
+                    "(non-first stages need to receive data from previous stage)"
+                )
+            
+            # Non-last stages need next_stage_addr to send to next stage
+            if not is_last and self.pipeline_next_stage_addr is None:
+                raise ValueError(
+                    f"pipeline_next_stage_addr must be set for stage {self.pipeline_stage_idx} "
+                    "(non-last stages need to send data to next stage)"
+                )
+            
+            # Last stage needs prev_stage_addr for return path to stage 0
+            if is_last and self.pipeline_prev_stage_addr is None:
+                raise ValueError(
+                    f"pipeline_prev_stage_addr must be set for stage {self.pipeline_stage_idx} "
+                    "(last stage needs return path address to send results back to stage 0)"
+                )
+            
+            # Stage 0 needs a return listen port if there are multiple stages
+            # (to receive final results from the last stage)
+            if is_first and not is_last and self.pipeline_local_listen_port is None:
+                raise ValueError(
+                    f"pipeline_local_listen_port must be set for stage 0 when "
+                    f"pipeline_total_stages > 1 (to receive return results from last stage)"
+                )
+            
             # In external mode, pipeline_parallel_size should be 1 for world_size calculation
             # but we keep the original value for compatibility
             # The actual PP communication uses ZeroMQ, not PyTorch distributed

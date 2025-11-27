@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import signal
 
+import torch
 import uvloop
 
 import vllm
@@ -89,6 +90,11 @@ def run_external_pp_worker(args: argparse.Namespace):
     pipeline-parallel communication inside the model executor) but does
     not start FastAPI/Uvicorn. It is intended for stages with
     pipeline_stage_mode=\"external\" and pipeline_stage_idx > 0.
+    
+    For external PP stages 1..N-1, this runs a loop that:
+    1. Receives tensor_dict from previous stage via ZeroMQ
+    2. Processes it through local model layers
+    3. Forwards result to next stage (or returns to stage 0 if last stage)
     """
 
     async def _main() -> None:
@@ -104,18 +110,63 @@ def run_external_pp_worker(args: argparse.Namespace):
             # Simple health check: ensure engine initialized successfully.
             await engine_client.check_health()
 
-            stage_idx = getattr(args, "pipeline_stage_idx", None)
-            logger.info(
-                "External PP worker started for pipeline stage %s. "
-                "Waiting for shutdown (Ctrl+C / SIGTERM)...",
-                stage_idx,
+            # Get PP group info from the worker process via collective_rpc
+            # collective_rpc returns a list (one per worker), but we only have one worker
+            pp_info_list = await engine_client.collective_rpc(
+                "get_pp_group_info",
+                timeout=30.0,
             )
+            pp_info = pp_info_list[0]  # Extract first (and only) result
+            stage_idx = pp_info["stage_idx"]
+            is_last = pp_info["is_last_rank"]
+            
+            logger.info(
+                "External PP worker started for pipeline stage %s (is_last=%s). "
+                "Starting ZeroMQ pipeline loop...",
+                stage_idx,
+                is_last,
+            )
+            
+            # Wait a short time to ensure all ZeroMQ connections are fully established
+            # This helps avoid race conditions where stage_0 sends before later stages are ready
+            await asyncio.sleep(2.0)
+            logger.info(f"Stage {stage_idx}: ZeroMQ connections should be ready, starting receive loop...")
 
+            # Run the external PP pipeline loop
+            # NOTE: We use run_external_pipeline_step which runs entirely in the worker process
+            # to avoid tensor serialization issues with collective_rpc/msgspec
             try:
                 while True:
-                    await asyncio.sleep(3600)
+                    logger.debug(f"Stage {stage_idx}: Waiting for tensor dict from previous stage...")
+                    # Run the complete pipeline step in the worker process
+                    # This avoids serializing tensors through collective_rpc
+                    result_list = await engine_client.collective_rpc(
+                        "run_external_pipeline_step",
+                        timeout=300.0,  # 5 minute timeout for receiving/processing
+                    )
+                    success = result_list[0]  # Extract first (and only) result
+                    
+                    if not success:
+                        # No data received (timeout or empty), continue loop
+                        logger.debug(f"Stage {stage_idx}: No data received, continuing...")
+                        await asyncio.sleep(0.1)  # Small sleep to avoid busy loop
+                        continue
+                    
+                    logger.debug(
+                        f"Stage {stage_idx}: Successfully processed pipeline step"
+                    )
+            except Exception as e:
+                logger.exception(
+                    f"Stage {stage_idx}: Error processing pipeline step: {e}"
+                )
+                # Continue loop to allow recovery
+                await asyncio.sleep(1)
+                        
             except (KeyboardInterrupt, SystemExit):
                 logger.info("External PP worker received shutdown signal.")
+            except Exception as e:
+                logger.exception(f"External PP worker encountered fatal error: {e}")
+                raise
 
     set_process_title("ExternalPPWorker")
     decorate_logs()

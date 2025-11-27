@@ -477,7 +477,17 @@ class Worker(WorkerBase):
         # fragmentation issue.
         # NOTE: This is called after `capture_model` on purpose to prevent
         # memory buffers from being cleared by `torch.cuda.empty_cache`.
-        if get_pp_group().is_last_rank:
+        # In external PP mode, logits_processor is on is_first_rank (stage_0)
+        # In internal PP mode, it's on is_last_rank
+        # Only call _dummy_sampler_run if we have logits_processor
+        from vllm.distributed import get_pp_group
+        pp_group = get_pp_group()
+        should_compute_logits = (
+            pp_group.is_first_rank
+            if self.model_runner.parallel_config.pipeline_stage_mode == "external"
+            else pp_group.is_last_rank
+        )
+        if should_compute_logits:
             max_num_reqs = min(
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens,
@@ -526,6 +536,50 @@ class Worker(WorkerBase):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
+    
+    def execute_external_pipeline_step(
+        self, tensor_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute one pipeline step for external PP stages (non-stage-0)."""
+        return self.model_runner.execute_external_pipeline_step(tensor_dict)
+    
+    def get_pp_group_info(self) -> dict[str, Any]:
+        """Get PP group information for external PP worker loop."""
+        pp_group = get_pp_group()
+        return {
+            "is_first_rank": pp_group.is_first_rank,
+            "is_last_rank": pp_group.is_last_rank,
+            "stage_idx": pp_group.rank_in_group,
+        }
+    
+    def recv_tensor_dict_external(self) -> dict[str, Any] | None:
+        """Receive tensor dict from previous stage (for external PP worker loop)."""
+        return get_pp_group().recv_tensor_dict()
+    
+    def send_tensor_dict_external(self, tensor_dict: dict[str, Any]) -> None:
+        """Send tensor dict to next stage (for external PP worker loop)."""
+        get_pp_group().send_tensor_dict(tensor_dict)
+    
+    def run_external_pipeline_step(self) -> bool:
+        """Run one complete external pipeline step: receive, process, send.
+        
+        This method runs entirely in the worker process, avoiding tensor
+        serialization issues with collective_rpc. Returns True if a step
+        was processed, False if no data was received (timeout/empty).
+        """
+        # Receive tensor_dict from previous stage
+        tensor_dict = get_pp_group().recv_tensor_dict()
+        if tensor_dict is None:
+            return False
+        
+        # Process through local model layers
+        output_tensor_dict = self.model_runner.execute_external_pipeline_step(tensor_dict)
+        if output_tensor_dict is None:
+            return False
+        
+        # Send to next stage (or return to stage 0 if last stage)
+        get_pp_group().send_tensor_dict(output_tensor_dict)
+        return True
 
     @torch.inference_mode()
     def execute_model(

@@ -397,6 +397,12 @@ class GPUModelRunner(
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
+        
+        # External PP block_table persistence: request_id -> block_table per KV cache group
+        # Format: {request_id: {kv_cache_gid: torch.Tensor}}
+        # This ensures the same request uses consistent block IDs across decode steps
+        # so that KV cache can be correctly read and written
+        self._external_pp_block_tables: dict[str, dict[int, torch.Tensor]] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -691,6 +697,13 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # Clean up external PP block_table for finished requests
+            if (self.parallel_config.pipeline_stage_mode == "external" and 
+                req_id in self._external_pp_block_tables):
+                self._external_pp_block_tables.pop(req_id, None)
+                logger.debug(
+                    f"External PP: Cleaned up block_table for finished request_id={req_id}"
+                )
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -774,6 +787,12 @@ class GPUModelRunner(
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
+        # In external PP mode, stage_0 (is_first_rank) completes the full pipeline
+        # and returns logits, so it should be treated like is_last_rank
+        is_external_pp_stage0 = (
+            self.parallel_config.pipeline_stage_mode == "external"
+            and get_pp_group().is_first_rank
+        )
         req_data = scheduler_output.scheduled_cached_reqs
 
         # Wait until valid_sampled_tokens_count is copied to cpu,
@@ -815,21 +834,25 @@ class GPUModelRunner(
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
 
-            if not is_last_rank:
+            # In external PP mode, stage_0 completes the full pipeline and returns logits,
+            # so it should be treated like is_last_rank (not accessing new_token_ids)
+            if not is_last_rank and not is_external_pp_stage0:
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker.
-                new_token_ids = req_data.new_token_ids[i]
-                # Add the sampled token(s) from the previous step (if any).
-                # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                )
-                if num_new_tokens == 1:
-                    # Avoid slicing list in most common case.
-                    req_state.output_token_ids.append(new_token_ids[-1])
-                elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+                # Check bounds to avoid IndexError
+                if i < len(req_data.new_token_ids):
+                    new_token_ids = req_data.new_token_ids[i]
+                    # Add the sampled token(s) from the previous step (if any).
+                    # This doesn't include "unverified" tokens like spec tokens.
+                    num_new_tokens = (
+                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                    )
+                    if num_new_tokens == 1:
+                        # Avoid slicing list in most common case.
+                        req_state.output_token_ids.append(new_token_ids[-1])
+                    elif num_new_tokens > 0:
+                        req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -876,7 +899,9 @@ class GPUModelRunner(
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
-            if not is_last_rank:
+            # In external PP mode, stage_0 completes the full pipeline and returns logits,
+            # so it should be treated like is_last_rank (not updating token_ids_cpu with new_token_ids)
+            if not is_last_rank and not is_external_pp_stage0:
                 # Add new_token_ids to token_ids_cpu.
                 start_token_index = num_computed_tokens
                 end_token_index = num_computed_tokens + len(new_token_ids)
@@ -1608,6 +1633,353 @@ class GPUModelRunner(
                         attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _build_minimal_attention_metadata_for_external_pp(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        step_type: str,
+        positions: torch.Tensor | None = None,
+        num_actual_tokens: int | None = None,
+        request_ids: list[str] | None = None,
+    ) -> PerLayerAttnMetadata:
+        """Build minimal attention metadata for external PP stages.
+        
+        In external PP mode, we don't have full scheduler information, so we
+        build minimal metadata using dummy values. This allows KV cache to
+        be updated correctly, though the slot mapping may not be perfect.
+        
+        Args:
+            num_tokens: Number of tokens in the batch
+            num_reqs: Number of requests
+            step_type: "prefill" or "decode"
+        
+        Returns:
+            Minimal attention metadata dict for each layer
+        """
+        from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+        
+        # Build minimal query_start_loc: [0, num_tokens]
+        # For decode, each request has 1 token, so query_start_loc = [0, 1, 2, ..., num_reqs]
+        # For prefill, query_start_loc depends on actual sequence lengths, but we use a simple approximation
+        if step_type == "decode":
+            # Decode: each request has 1 token
+            query_start_loc = torch.arange(
+                num_reqs + 1, dtype=torch.int32, device=self.device
+            )
+            query_start_loc_cpu = query_start_loc.cpu()
+            
+            # In decode, seq_lens should be position + 1 (position is 0-indexed)
+            # If positions are available, use them; otherwise use dummy values
+            if positions is not None and len(positions) == num_tokens:
+                # seq_len = position + 1 for each token
+                positions_cpu = positions.cpu() if positions.device != torch.device("cpu") else positions
+                seq_lens_cpu = (positions_cpu + 1).int()
+                seq_lens = seq_lens_cpu.to(self.device)
+                max_seq_len = int(seq_lens_cpu.max().item())
+            else:
+                # Fallback: assume seq_len = 1 (may not be correct)
+                seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=self.device)
+                seq_lens_cpu = seq_lens.cpu()
+                max_seq_len = 1
+            max_query_len = 1
+        else:
+            # Prefill: use positions if available to compute accurate seq_lens
+            if positions is not None and len(positions) == num_tokens:
+                # Use actual positions to compute sequence lengths
+                positions_cpu = positions.cpu() if positions.device != torch.device("cpu") else positions
+                # In prefill, positions are [0, 1, 2, ..., seq_len-1] for each request
+                # We need to group positions by request to compute seq_lens
+                # For simplicity, assume uniform distribution if we can't determine request boundaries
+                # But try to infer from positions if possible
+                if num_reqs == 1:
+                    # Single request: use num_actual_tokens if provided (to exclude padding), otherwise max(position) + 1
+                    if num_actual_tokens is not None:
+                        # Use actual token count to exclude padding
+                        seq_lens = torch.tensor([num_actual_tokens], dtype=torch.int32, device=self.device)
+                        seq_lens_cpu = seq_lens.cpu()
+                        max_seq_len = num_actual_tokens
+                    else:
+                        # Fallback: use max(position) + 1 (may include padding)
+                        max_pos = int(positions_cpu.max().item())
+                        seq_lens = torch.tensor([max_pos + 1], dtype=torch.int32, device=self.device)
+                        seq_lens_cpu = seq_lens.cpu()
+                        max_seq_len = max_pos + 1
+                    query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=self.device)
+                    query_start_loc_cpu = query_start_loc.cpu()
+                    max_query_len = num_tokens
+                    logger.debug(
+                        f"External PP prefill (num_reqs=1): num_tokens={num_tokens}, "
+                        f"num_actual_tokens={num_actual_tokens}, seq_lens={seq_lens.tolist()}, "
+                        f"query_start_loc={query_start_loc_cpu.tolist()}, max_seq_len={max_seq_len}"
+                    )
+                else:
+                    # Multiple requests: assume uniform distribution (approximation)
+                    tokens_per_req = num_tokens // num_reqs if num_reqs > 0 else num_tokens
+                    query_start_loc = torch.arange(
+                        0, num_tokens + 1, tokens_per_req, dtype=torch.int32, device=self.device
+                    )
+                    if len(query_start_loc) < num_reqs + 1:
+                        # Pad if needed
+                        padding = torch.full(
+                            (num_reqs + 1 - len(query_start_loc),),
+                            num_tokens,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        query_start_loc = torch.cat([query_start_loc, padding])
+                    query_start_loc = query_start_loc[: num_reqs + 1]
+                    query_start_loc_cpu = query_start_loc.cpu()
+                    seq_lens = torch.full(
+                        (num_reqs,), tokens_per_req, dtype=torch.int32, device=self.device
+                    )
+                    seq_lens_cpu = seq_lens.cpu()
+                    max_seq_len = tokens_per_req
+                    max_query_len = tokens_per_req
+            else:
+                # Fallback: assume uniform distribution (approximation)
+                tokens_per_req = num_tokens // num_reqs if num_reqs > 0 else num_tokens
+                query_start_loc = torch.arange(
+                    0, num_tokens + 1, tokens_per_req, dtype=torch.int32, device=self.device
+                )
+                if len(query_start_loc) < num_reqs + 1:
+                    # Pad if needed
+                    padding = torch.full(
+                        (num_reqs + 1 - len(query_start_loc),),
+                        num_tokens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    query_start_loc = torch.cat([query_start_loc, padding])
+                query_start_loc = query_start_loc[: num_reqs + 1]
+                query_start_loc_cpu = query_start_loc.cpu()
+                seq_lens = torch.full(
+                    (num_reqs,), tokens_per_req, dtype=torch.int32, device=self.device
+                )
+                seq_lens_cpu = seq_lens.cpu()
+                max_seq_len = tokens_per_req
+                max_query_len = tokens_per_req
+        
+        # Build minimal block_table and slot_mapping
+        # For external PP, we use dummy values - KV cache will still work but
+        # may not be optimally organized
+        attn_metadata: PerLayerAttnMetadata = {}
+        
+        for kv_cache_gid, kv_cache_group in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                # Encoder-only: no KV cache
+                blk_table_tensor = torch.zeros(
+                    (num_reqs, 1), dtype=torch.int32, device=self.device
+                )
+                slot_mapping = torch.zeros(
+                    (num_tokens,), dtype=torch.int64, device=self.device
+                )
+            else:
+                # Decoder: create minimal block table and slot mapping
+                # In decode phase, we need consistent block_table across decode steps
+                # For external PP, we use persistent block_table per request to ensure
+                # KV cache can be correctly read and written across decode steps
+                block_size = kv_cache_group.kv_cache_spec.block_size
+                # Use max_seq_len for current sequence, but ensure we have enough blocks
+                # In decode, max_seq_len is the current sequence length (position + 1)
+                # We need enough blocks to cover the entire sequence up to max_model_len
+                max_num_blocks_per_seq = (self.max_model_len + block_size - 1) // block_size
+                blk_table_tensor = torch.zeros(
+                    (num_reqs, max_num_blocks_per_seq), dtype=torch.int32, device=self.device
+                )
+                
+                # CRITICAL: Use persistent block_table for external PP mode
+                # This ensures the same request uses consistent block IDs across decode steps
+                # so that KV cache can be correctly read and written
+                if (self.parallel_config.pipeline_stage_mode == "external" and 
+                    request_ids is not None and len(request_ids) == num_reqs):
+                    # External PP mode with request_ids: use persistent block_table
+                    from vllm.distributed.parallel_state import get_pp_group
+                    stage_idx = get_pp_group().rank_in_group
+                    
+                    # Track next available block ID for new requests
+                    # We need to find the maximum block ID already allocated to avoid conflicts
+                    next_block_id = 1  # Start from 1 (0 is reserved for null block)
+                    for existing_req_id, existing_tables in self._external_pp_block_tables.items():
+                        if kv_cache_gid in existing_tables:
+                            existing_table = existing_tables[kv_cache_gid]
+                            if existing_table.numel() > 0:
+                                max_existing_block = int(existing_table.max().item())
+                                next_block_id = max(next_block_id, max_existing_block + 1)
+                    
+                    for i, req_id in enumerate(request_ids):
+                        if req_id in self._external_pp_block_tables:
+                            # Request exists: reuse its block_table
+                            req_tables = self._external_pp_block_tables[req_id]
+                            if kv_cache_gid in req_tables:
+                                # Reuse existing block_table for this KV cache group
+                                existing_table = req_tables[kv_cache_gid]
+                                if existing_table.shape[0] >= max_num_blocks_per_seq:
+                                    blk_table_tensor[i, :] = existing_table[:max_num_blocks_per_seq]
+                                    logger.info(
+                                        f"External PP stage {stage_idx}: Reusing block_table for "
+                                        f"request_id={req_id}, kv_cache_gid={kv_cache_gid}, "
+                                        f"block_ids={blk_table_tensor[i, :min(10, max_num_blocks_per_seq)].tolist()}"
+                                        f"{'...' if max_num_blocks_per_seq > 10 else ''}"
+                                    )
+                                else:
+                                    # Existing table is too small, need to extend it
+                                    # This shouldn't happen, but handle gracefully
+                                    logger.warning(
+                                        f"External PP stage {stage_idx}: Existing block_table for "
+                                        f"request_id={req_id}, kv_cache_gid={kv_cache_gid} is too small "
+                                        f"(size={existing_table.shape[0]}, needed={max_num_blocks_per_seq}). "
+                                        f"Allocating new block_table."
+                                    )
+                                    # Allocate new block_table
+                                    new_block_ids = torch.arange(
+                                        next_block_id,
+                                        next_block_id + max_num_blocks_per_seq,
+                                        dtype=torch.int32,
+                                        device=self.device,
+                                    )
+                                    blk_table_tensor[i, :] = new_block_ids
+                                    # Update stored block_table
+                                    req_tables[kv_cache_gid] = new_block_ids.clone()
+                                    logger.info(
+                                        f"External PP stage {stage_idx}: Allocating new block_table for "
+                                        f"request_id={req_id}, kv_cache_gid={kv_cache_gid}, "
+                                        f"block_ids={new_block_ids[:min(10, max_num_blocks_per_seq)].tolist()}"
+                                        f"{'...' if max_num_blocks_per_seq > 10 else ''}"
+                                    )
+                                    next_block_id += max_num_blocks_per_seq
+                            else:
+                                # KV cache group not found for this request, allocate new
+                                new_block_ids = torch.arange(
+                                    next_block_id,
+                                    next_block_id + max_num_blocks_per_seq,
+                                    dtype=torch.int32,
+                                    device=self.device,
+                                )
+                                blk_table_tensor[i, :] = new_block_ids
+                                req_tables[kv_cache_gid] = new_block_ids.clone()
+                                logger.info(
+                                    f"External PP stage {stage_idx}: Allocating new block_table for "
+                                    f"request_id={req_id}, kv_cache_gid={kv_cache_gid}, "
+                                    f"block_ids={new_block_ids[:min(10, max_num_blocks_per_seq)].tolist()}"
+                                    f"{'...' if max_num_blocks_per_seq > 10 else ''}"
+                                )
+                                next_block_id += max_num_blocks_per_seq
+                        else:
+                            # New request: allocate new block_table
+                            new_block_ids = torch.arange(
+                                next_block_id,
+                                next_block_id + max_num_blocks_per_seq,
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                            blk_table_tensor[i, :] = new_block_ids
+                            # Store block_table for future reuse
+                            self._external_pp_block_tables[req_id] = {kv_cache_gid: new_block_ids.clone()}
+                            logger.info(
+                                f"External PP stage {stage_idx}: Allocating new block_table for "
+                                f"request_id={req_id}, kv_cache_gid={kv_cache_gid}, "
+                                f"block_ids={new_block_ids[:min(10, max_num_blocks_per_seq)].tolist()}"
+                                f"{'...' if max_num_blocks_per_seq > 10 else ''}"
+                            )
+                            next_block_id += max_num_blocks_per_seq
+                else:
+                    # Fallback: assign sequential block IDs (non-persistent)
+                    # This is used when request_ids are not provided or in non-external PP mode
+                    for i in range(num_reqs):
+                        blk_table_tensor[i, :] = torch.arange(
+                            1 + i * max_num_blocks_per_seq,
+                            1 + (i + 1) * max_num_blocks_per_seq,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                
+                # Create slot mapping based on positions if available
+                # slot_mapping = block_id * block_size + position % block_size
+                if positions is not None and len(positions) == num_tokens:
+                    # Use actual positions to compute slot mapping
+                    # Ensure positions are on the correct device
+                    positions_device = positions.to(self.device) if positions.device != self.device else positions
+                    # Initialize slot_mapping with -1 (padding slot ID) to mark padding tokens
+                    # This prevents KV cache from being inadvertently updated with padding tokens
+                    PADDING_SLOT_ID = -1
+                    slot_mapping = torch.full((num_tokens,), PADDING_SLOT_ID, dtype=torch.int64, device=self.device)
+                    
+                    for req_idx in range(num_reqs):
+                        start_idx = query_start_loc_cpu[req_idx].item()
+                        end_idx = query_start_loc_cpu[req_idx + 1].item()
+                        if start_idx < num_tokens and end_idx <= num_tokens:
+                            # Only compute slot_mapping for actual tokens (exclude padding)
+                            # If num_actual_tokens is provided, limit to that range
+                            actual_end_idx = min(end_idx, num_actual_tokens) if num_actual_tokens is not None else end_idx
+                            if start_idx < actual_end_idx:
+                                req_positions = positions_device[start_idx:actual_end_idx]
+                                # Compute block indices for this request's positions
+                                # block_index = position // block_size
+                                block_indices = (req_positions // block_size).long()
+                                # Clamp block indices to valid range (0 to max_num_blocks_per_seq - 1)
+                                block_indices = torch.clamp(block_indices, 0, max_num_blocks_per_seq - 1)
+                                # Get block IDs from block table
+                                block_ids = blk_table_tensor[req_idx, block_indices]
+                                # Compute slot mapping: block_id * block_size + position % block_size
+                                # This ensures KV cache is updated at the correct slot for each position
+                                slot_mapping[start_idx:actual_end_idx] = (
+                                    block_ids * block_size + (req_positions % block_size)
+                                ).long()
+                            # Debug logging for slot_mapping computation
+                            req_id_str = request_ids[req_idx] if request_ids and req_idx < len(request_ids) else f"req_{req_idx}"
+                            logger.info(
+                                f"External PP stage {get_pp_group().rank_in_group}: Computing slot_mapping for "
+                                f"request_id={req_id_str}, req_idx={req_idx}, start_idx={start_idx}, end_idx={end_idx}, "
+                                f"actual_end_idx={actual_end_idx}, num_actual_tokens={num_actual_tokens}, "
+                                f"num_req_positions={len(req_positions)}, "
+                                f"req_positions={req_positions[:min(5, len(req_positions))].tolist()}{'...' if len(req_positions) > 5 else ''}, "
+                                f"block_indices={block_indices[:min(5, len(block_indices))].tolist()}{'...' if len(block_indices) > 5 else ''}, "
+                                f"block_ids={block_ids[:min(5, len(block_ids))].tolist()}{'...' if len(block_ids) > 5 else ''}, "
+                                f"slot_mapping={slot_mapping[start_idx:min(start_idx+5, actual_end_idx)].tolist()}{'...' if (actual_end_idx - start_idx) > 5 else ''}"
+                            )
+                else:
+                    # Fallback: sequential slots (may not be correct for decode)
+                    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+            
+            num_computed_tokens_cpu = torch.zeros(
+                num_reqs, dtype=torch.int32
+            )
+            if step_type == "decode":
+                # In decode, num_computed_tokens = seq_len - 1 (previous tokens)
+                num_computed_tokens_cpu = seq_lens_cpu - 1
+            
+            # Use num_actual_tokens if provided (to exclude padding), otherwise use num_tokens
+            # This ensures attention backends only process actual tokens, not padding
+            effective_num_actual_tokens = num_actual_tokens if num_actual_tokens is not None else num_tokens
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=effective_num_actual_tokens,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                block_table_tensor=blk_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+            )
+            
+            # Build per-layer metadata using the metadata builder
+            for attn_gid, attn_group in enumerate(self.attn_groups[kv_cache_gid]):
+                builder = attn_group.get_metadata_builder()
+                attn_metadata_i = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = attn_metadata_i
+        
+        return attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -2809,6 +3181,281 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # External PP mode: stage 0 orchestrates the pipeline
+            if (
+                self.parallel_config.pipeline_stage_mode == "external"
+                and get_pp_group().is_first_rank
+            ):
+                # DEBUG: Log model layer configuration
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'start_layer'):
+                    logger.info(
+                        f"Stage 0 [DEBUG]: Model layer config - "
+                        f"start_layer={self.model.model.start_layer}, "
+                        f"end_layer={self.model.model.end_layer}, "
+                        f"num_layers={len(self.model.model.layers) if hasattr(self.model.model, 'layers') else 'N/A'}"
+                    )
+                elif hasattr(self.model, 'start_layer'):
+                    logger.info(
+                        f"Stage 0 [DEBUG]: Model layer config - "
+                        f"start_layer={self.model.start_layer}, "
+                        f"end_layer={self.model.end_layer}, "
+                        f"num_layers={len(self.model.layers) if hasattr(self.model, 'layers') else 'N/A'}"
+                    )
+                else:
+                    logger.info(
+                        f"Stage 0 [DEBUG]: Model layer config - "
+                        f"model type={type(self.model)}, "
+                        f"hasattr model.model={hasattr(self.model, 'model')}"
+                    )
+                
+                # Stage 0: send forward to next stage, then receive return
+                # In external PP, stage 0 only has embedding + first few layers,
+                # so it should get IntermediateTensors from the model
+                if not isinstance(hidden_states, IntermediateTensors):
+                    # If we got raw hidden states (shouldn't happen in external PP),
+                    # wrap them in IntermediateTensors format
+                    hidden_states = IntermediateTensors(
+                        tensors={"hidden_states": hidden_states},
+                        kv_connector_output=kv_connector_output,
+                    )
+                
+                # Package intermediate tensors with metadata for forwarding
+                # Determine step type: prefill has more tokens than requests
+                is_prefill = num_scheduled_tokens > num_reqs
+                
+                # DEBUG: Log IntermediateTensors contents
+                logger.info(
+                    f"Stage 0 [DEBUG]: IntermediateTensors keys: {list(hidden_states.tensors.keys())}, "
+                    f"step_type={'prefill' if is_prefill else 'decode'}"
+                )
+                for key, tensor in hidden_states.tensors.items():
+                    logger.info(
+                        f"Stage 0 [DEBUG]: IntermediateTensors['{key}'] - "
+                        f"shape={tensor.shape}, dtype={tensor.dtype}, "
+                        f"mean={tensor.float().mean().item():.6f}, "
+                        f"std={tensor.float().std().item():.6f}, "
+                        f"min={tensor.float().min().item():.6f}, "
+                        f"max={tensor.float().max().item():.6f}"
+                    )
+                
+                # Extract hidden_states from IntermediateTensors
+                # IntermediateTensors.tensors may contain "hidden_states" or "residual"
+                # We need to ensure "hidden_states" key exists for next stage
+                if "hidden_states" in hidden_states.tensors:
+                    main_hidden_states = hidden_states.tensors["hidden_states"]
+                elif "residual" in hidden_states.tensors:
+                    # Use residual as hidden_states if hidden_states key doesn't exist
+                    main_hidden_states = hidden_states.tensors["residual"]
+                else:
+                    # Fallback: use first tensor in tensors dict
+                    tensor_keys = list(hidden_states.tensors.keys())
+                    if not tensor_keys:
+                        raise RuntimeError(
+                            "IntermediateTensors.tensors is empty. Cannot forward to next stage."
+                        )
+                    main_hidden_states = hidden_states.tensors[tensor_keys[0]]
+                    logger.warning(
+                        f"Stage 0: No 'hidden_states' or 'residual' key found in IntermediateTensors. "
+                        f"Using first tensor key '{tensor_keys[0]}' as hidden_states."
+                    )
+                
+                # DEBUG: Log hidden_states before sending
+                logger.info(
+                    f"Stage 0 [DEBUG]: About to send hidden_states to next stage - "
+                    f"shape={main_hidden_states.shape}, dtype={main_hidden_states.dtype}, "
+                    f"device={main_hidden_states.device}, "
+                    f"mean={main_hidden_states.float().mean().item():.6f}, "
+                    f"std={main_hidden_states.float().std().item():.6f}, "
+                    f"min={main_hidden_states.float().min().item():.6f}, "
+                    f"max={main_hidden_states.float().max().item():.6f}, "
+                    f"step_type={'prefill' if is_prefill else 'decode'}, num_tokens={num_scheduled_tokens}"
+                )
+                
+                forward_tensor_dict = {
+                    "hidden_states": main_hidden_states.cpu(),  # Move to CPU for ZeroMQ serialization
+                    "step_type": "prefill" if is_prefill else "decode",
+                    "num_tokens": num_scheduled_tokens,  # Send actual token count (not padded) for metadata calculation
+                    "num_reqs": num_reqs,
+                    "request_ids": req_ids,
+                }
+                
+                # Include positions tensor - critical for correct rotary embeddings in decode phase
+                # positions is already computed in _preprocess and used in model forward
+                # IMPORTANT: positions must match hidden_states length (which may be padded)
+                # hidden_states may be padded for CUDA graphs, so positions should match its length
+                # However, positions array itself may also be padded (with 0s), so we need to:
+                # 1. Use only actual tokens' positions (first num_scheduled_tokens)
+                # 2. Pad to match hidden_states_len if needed (using last actual position + 1)
+                if positions is not None:
+                    # Use hidden_states length to determine positions length
+                    # This ensures positions match hidden_states shape for model forward
+                    hidden_states_len = main_hidden_states.shape[0]
+                    # First, extract only actual tokens' positions (avoid padding 0s in positions array)
+                    actual_tokens_positions = positions[:num_scheduled_tokens].cpu()
+                    
+                    # If hidden_states is padded beyond actual tokens, pad positions accordingly
+                    if hidden_states_len > num_scheduled_tokens:
+                        # Calculate the last actual position value
+                        last_actual_pos = actual_tokens_positions[-1].item() if len(actual_tokens_positions) > 0 else 0
+                        # Pad with consecutive positions starting from last_actual_pos + 1
+                        padding_len = hidden_states_len - num_scheduled_tokens
+                        padding = torch.arange(
+                            last_actual_pos + 1,
+                            last_actual_pos + 1 + padding_len,
+                            dtype=positions.dtype,
+                            device=positions.device
+                        )
+                        actual_positions = torch.cat([actual_tokens_positions, padding.cpu()])
+                    else:
+                        # If hidden_states_len <= num_scheduled_tokens, use only what we need
+                        actual_positions = actual_tokens_positions[:hidden_states_len]
+                    
+                    forward_tensor_dict["positions"] = actual_positions
+                    logger.info(
+                        f"Stage 0: Sending positions to next stage: {actual_positions.tolist()}, "
+                        f"step_type={forward_tensor_dict['step_type']}, hidden_states_len={hidden_states_len}, "
+                        f"num_scheduled_tokens={num_scheduled_tokens}, num_input_tokens={num_input_tokens}"
+                    )
+                
+                # Include other tensors from IntermediateTensors if needed (e.g., residual)
+                for key, value in hidden_states.tensors.items():
+                    if key != "hidden_states" and isinstance(value, torch.Tensor):
+                        forward_tensor_dict[key] = value.cpu()
+                
+                # Add logits_indices if it's a tensor (convert to list for serialization)
+                if isinstance(logits_indices, torch.Tensor):
+                    forward_tensor_dict["logits_indices"] = logits_indices.cpu().tolist()
+                else:
+                    forward_tensor_dict["logits_indices"] = logits_indices
+                
+                logger.debug(
+                    f"Stage 0: Sending forward tensor dict with {len(hidden_states.tensors)} tensors, "
+                    f"{num_input_tokens} tokens, {num_reqs} requests, step_type={forward_tensor_dict['step_type']}"
+                )
+                
+                # Send forward to stage 1
+                get_pp_group().send_tensor_dict(forward_tensor_dict)
+                
+                # Receive final hidden states from last stage
+                logger.debug("Stage 0: Waiting for return from last stage...")
+                return_tensor_dict = get_pp_group().recv_tensor_dict()
+                
+                if return_tensor_dict is None:
+                    raise RuntimeError(
+                        "Stage 0: Failed to receive return tensor dict from last stage. "
+                        "This may indicate a stage failure or timeout."
+                    )
+                
+                # Extract final hidden states from return
+                if "hidden_states" not in return_tensor_dict:
+                    raise RuntimeError(
+                        "Stage 0: Return tensor dict missing 'hidden_states' key. "
+                        f"Received keys: {list(return_tensor_dict.keys())}"
+                    )
+                
+                final_hidden_states = return_tensor_dict["hidden_states"]
+                # Ensure it's on the correct device
+                if final_hidden_states.device != self.device:
+                    final_hidden_states = final_hidden_states.to(self.device)
+                
+                # DEBUG: Log received final_hidden_states statistics
+                logger.info(
+                    f"Stage 0 [DEBUG]: Received final_hidden_states - "
+                    f"shape={final_hidden_states.shape}, dtype={final_hidden_states.dtype}, "
+                    f"device={final_hidden_states.device}, "
+                    f"mean={final_hidden_states.float().mean().item():.6f}, "
+                    f"std={final_hidden_states.float().std().item():.6f}, "
+                    f"min={final_hidden_states.float().min().item():.6f}, "
+                    f"max={final_hidden_states.float().max().item():.6f}"
+                )
+                logger.info(
+                    f"Stage 0 [DEBUG]: Return tensor_dict keys: {list(return_tensor_dict.keys())}, "
+                    f"step_type={return_tensor_dict.get('step_type', 'N/A')}, "
+                    f"num_tokens={return_tensor_dict.get('num_tokens', 'N/A')}, "
+                    f"logits_indices type={type(logits_indices)}, value={logits_indices}"
+                )
+                
+                # Extract sample positions for logits computation
+                if isinstance(logits_indices, torch.Tensor):
+                    sample_hidden_states = final_hidden_states[logits_indices]
+                else:
+                    # logits_indices is a list or slice
+                    sample_hidden_states = final_hidden_states[logits_indices]
+                
+                # DEBUG: Log sample_hidden_states statistics
+                logger.info(
+                    f"Stage 0 [DEBUG]: Extracted sample_hidden_states - "
+                    f"shape={sample_hidden_states.shape}, dtype={sample_hidden_states.dtype}, "
+                    f"device={sample_hidden_states.device}, "
+                    f"mean={sample_hidden_states.float().mean().item():.6f}, "
+                    f"std={sample_hidden_states.float().std().item():.6f}, "
+                    f"min={sample_hidden_states.float().min().item():.6f}, "
+                    f"max={sample_hidden_states.float().max().item():.6f}"
+                )
+                
+                # DEBUG: Check lm_head before computing logits
+                if hasattr(self.model, 'lm_head'):
+                    lm_head = self.model.lm_head
+                    logger.info(
+                        f"Stage 0 [DEBUG]: lm_head type={type(lm_head)}, "
+                        f"hasattr(weight)={hasattr(lm_head, 'weight')}"
+                    )
+                    if hasattr(lm_head, 'weight') and lm_head.weight is not None:
+                        logger.info(
+                            f"Stage 0 [DEBUG]: lm_head.weight - "
+                            f"shape={lm_head.weight.shape}, dtype={lm_head.weight.dtype}, "
+                            f"device={lm_head.weight.device}, "
+                            f"mean={lm_head.weight.float().mean().item():.6f}, "
+                            f"std={lm_head.weight.float().std().item():.6f}, "
+                            f"min={lm_head.weight.float().min().item():.6f}, "
+                            f"max={lm_head.weight.float().max().item():.6f}"
+                        )
+                    if hasattr(self.model, 'logits_processor'):
+                        logger.info(
+                            f"Stage 0 [DEBUG]: logits_processor exists={self.model.logits_processor is not None}, "
+                            f"type={type(self.model.logits_processor) if self.model.logits_processor else None}"
+                        )
+                else:
+                    logger.warning("Stage 0 [DEBUG]: model.lm_head does not exist!")
+                
+                # Compute logits from final hidden states
+                logits = self.model.compute_logits(sample_hidden_states)
+                
+                # DEBUG: Log computed logits statistics
+                logger.info(
+                    f"Stage 0 [DEBUG]: Computed logits - "
+                    f"shape={logits.shape}, dtype={logits.dtype}, "
+                    f"device={logits.device}, "
+                    f"mean={logits.float().mean().item():.6f}, "
+                    f"std={logits.float().std().item():.6f}, "
+                    f"min={logits.float().min().item():.6f}, "
+                    f"max={logits.float().max().item():.6f}"
+                )
+                # Log top-5 logits values for first token (if applicable)
+                if logits.numel() > 0:
+                    first_token_logits = logits[0] if logits.dim() > 1 else logits
+                    if first_token_logits.numel() > 5:
+                        top_k_values, top_k_indices = torch.topk(first_token_logits.float(), k=min(5, first_token_logits.numel()))
+                        logger.info(
+                            f"Stage 0 [DEBUG]: Top-5 logits values for first token: "
+                            f"indices={top_k_indices.cpu().tolist()}, "
+                            f"values={top_k_values.cpu().tolist()}"
+                        )
+                
+                # Store state for sample_tokens
+                self.execute_model_state = ExecuteModelState(
+                    scheduler_output,
+                    logits,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    final_hidden_states,
+                    sample_hidden_states,
+                    aux_hidden_states,
+                    ec_connector_output,
+                )
+                self.kv_connector_output = kv_connector_output
+                return None
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -2871,6 +3518,289 @@ class GPUModelRunner(
         self.kv_connector_output = kv_connector_output
         return None
 
+    def execute_external_pipeline_step(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+    ) -> dict[str, torch.Tensor | Any]:
+        """Execute one pipeline step for external PP stages (non-stage-0).
+        
+        This method is called by external PP workers to process a tensor_dict
+        received from the previous stage, run local layers, and return updated
+        tensor_dict for the next stage (or return path for last stage).
+        
+        Args:
+            tensor_dict: Dictionary containing hidden states and metadata from
+                previous stage. Must include:
+                - "hidden_states": torch.Tensor of shape [num_tokens, hidden_size]
+                - "step_type": "prefill" or "decode"
+                - "num_tokens": int
+                - "num_reqs": int
+                - "request_ids": list[str]
+                - "logits_indices": list[int] or torch.Tensor
+        
+        Returns:
+            Updated tensor_dict with processed hidden states, ready to send to
+            next stage (or return to stage 0 if this is the last stage).
+        """
+        from vllm.sequence import IntermediateTensors
+        
+        if self.parallel_config.pipeline_stage_mode != "external":
+            raise RuntimeError(
+                "execute_external_pipeline_step should only be called in external PP mode"
+            )
+        
+        if get_pp_group().is_first_rank:
+            raise RuntimeError(
+                "execute_external_pipeline_step should not be called on stage 0. "
+                "Stage 0 uses execute_model() directly."
+            )
+        
+        # Extract metadata
+        step_type = tensor_dict.get("step_type", "decode")
+        num_tokens_from_dict = tensor_dict.get("num_tokens")
+        num_reqs = tensor_dict.get("num_reqs")
+        request_ids = tensor_dict.get("request_ids", [])
+        logits_indices = tensor_dict.get("logits_indices")
+        
+        if num_tokens_from_dict is None:
+            raise ValueError("tensor_dict missing 'num_tokens'")
+        
+        # Extract hidden states (main tensor to process)
+        if "hidden_states" not in tensor_dict:
+            # Try to find it in IntermediateTensors format
+            if "residual" in tensor_dict:
+                # Assume hidden_states is the residual
+                hidden_states = tensor_dict["residual"]
+            else:
+                raise ValueError(
+                    f"tensor_dict missing 'hidden_states'. Available keys: {list(tensor_dict.keys())}"
+                )
+        else:
+            hidden_states = tensor_dict["hidden_states"]
+        
+        # CRITICAL: Validate that hidden_states is a tensor BEFORE any attribute access
+        # This prevents AttributeError if deserialization produces a list instead of a tensor
+        if not isinstance(hidden_states, torch.Tensor):
+            # Provide detailed error information for debugging deserialization issues
+            if isinstance(hidden_states, list):
+                list_info = f"length={len(hidden_states)}"
+                if len(hidden_states) > 0:
+                    first_elem = hidden_states[0]
+                    list_info += f", first_element_type={type(first_elem)}"
+                    if isinstance(first_elem, torch.Tensor):
+                        list_info += f", first_element_shape={first_elem.shape}, first_element_dtype={first_elem.dtype}"
+                raise ValueError(
+                    f"hidden_states is a list, not a tensor. This indicates a ZeroMQ deserialization issue. "
+                    f"tensor_dict keys: {list(tensor_dict.keys())}, "
+                    f"hidden_states type: {type(hidden_states)}, {list_info}. "
+                    f"This may occur if tensor_dict was incorrectly serialized/deserialized via ZeroMQ."
+                )
+            else:
+                raise ValueError(
+                    f"hidden_states must be a torch.Tensor, got {type(hidden_states)}. "
+                    f"tensor_dict keys: {list(tensor_dict.keys())}, "
+                    f"hidden_states value type: {type(hidden_states)}"
+                )
+        
+        # Now safe to access .device attribute after validation
+        # Ensure hidden states are on the correct device
+        if hidden_states.device != self.device:
+            hidden_states = hidden_states.to(self.device)
+        
+        # CRITICAL: Use hidden_states.shape[0] as num_tokens, not num_tokens_from_dict
+        # This is because hidden_states may be padded for CUDA graphs, and we need
+        # to process all tokens (including padding) to match the model's expected input size.
+        # num_tokens_from_dict represents the actual number of tokens (without padding),
+        # but hidden_states.shape[0] represents the padded size that the model expects.
+        # Store both values: num_tokens (padded) for model forward, num_tokens_from_dict (actual) for metadata
+        num_tokens = hidden_states.shape[0]
+        num_actual_tokens = num_tokens_from_dict
+        if num_tokens != num_actual_tokens:
+            logger.debug(
+                f"External PP stage {get_pp_group().rank_in_group}: "
+                f"num_tokens mismatch: hidden_states.shape[0]={num_tokens} vs "
+                f"num_actual_tokens={num_actual_tokens}. Using hidden_states.shape[0] "
+                f"for model forward (padding for CUDA graphs), but num_actual_tokens for seq_lens calculation."
+            )
+        
+        # Extract residual if available, otherwise use hidden_states as residual
+        # Llama model forward expects both "hidden_states" and "residual" in intermediate_tensors
+        residual = tensor_dict.get("residual")
+        if residual is not None:
+            if not isinstance(residual, torch.Tensor):
+                raise ValueError(
+                    f"residual must be a torch.Tensor, got {type(residual)}"
+                )
+            if residual.device != self.device:
+                residual = residual.to(self.device)
+        else:
+            # If no residual provided, use hidden_states as residual (common for first intermediate stage)
+            residual = hidden_states.clone()
+        
+        # Convert to IntermediateTensors format for model forward
+        # Llama model expects both "hidden_states" and "residual" keys
+        intermediate_tensors = IntermediateTensors(
+            tensors={
+                "hidden_states": hidden_states,
+                "residual": residual,
+            },
+            kv_connector_output=None,  # KV cache is local to each stage
+        )
+        
+        # Prepare model kwargs (minimal for external PP)
+        # We don't have full scheduler_output, so we use minimal metadata
+        model_kwargs = self._init_model_kwargs(num_tokens)
+        
+        # Run local model layers
+        logger.debug(
+            f"External PP stage {get_pp_group().rank_in_group}: Processing "
+            f"{num_tokens} tokens, {num_reqs} requests, step_type={step_type}"
+        )
+        
+        # Get positions from tensor_dict if provided (from stage_0)
+        # Stage_0 knows the correct token positions (including prompt length + generated tokens)
+        # If not provided, fallback to generating from sequence length (should only happen in prefill)
+        positions = tensor_dict.get("positions")
+        if positions is not None:
+            if not isinstance(positions, torch.Tensor):
+                # If positions is a list, convert to tensor
+                if isinstance(positions, list):
+                    positions = torch.tensor(positions, dtype=torch.long, device=self.device)
+                else:
+                    raise ValueError(
+                        f"positions must be a torch.Tensor or list, got {type(positions)}"
+                    )
+            # Ensure positions are on the correct device
+            if positions.device != self.device:
+                positions = positions.to(self.device)
+        else:
+            # Fallback: generate positions from sequence length
+            # This should only happen in prefill phase, not decode
+            seq_len = hidden_states.shape[0]
+            positions = torch.arange(seq_len, dtype=torch.long, device=self.device)
+            logger.warning(
+                f"External PP stage {get_pp_group().rank_in_group}: "
+                f"positions not provided in tensor_dict, generating from seq_len={seq_len}. "
+                f"This may cause incorrect rotary embeddings in decode phase."
+            )
+        
+        # Set forward context before model forward (required for CUDA graphs, etc.)
+        # For external PP, we need to build minimal attention metadata for KV cache updates
+        # Without proper metadata, attention backends may return zero outputs
+        # Pass num_actual_tokens for seq_lens calculation (to exclude padding), but num_tokens for slot_mapping (to include all tokens)
+        # Pass request_ids for persistent block_table management
+        attn_metadata = self._build_minimal_attention_metadata_for_external_pp(
+            num_tokens=num_tokens,  # Use padded num_tokens for slot_mapping (to match hidden_states length)
+            num_reqs=num_reqs,
+            step_type=step_type,
+            positions=positions,
+            num_actual_tokens=num_actual_tokens,  # Use actual token count for seq_lens calculation
+            request_ids=request_ids,  # Pass request_ids for persistent block_table management
+        )
+        with set_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=self.vllm_config,
+            num_tokens=num_tokens,
+        ):
+            model_output = self._model_forward(
+                input_ids=None,  # Not used for intermediate stages
+                positions=positions,  # Generated from hidden_states shape
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=None,
+                **model_kwargs,
+            )
+        
+        # Extract output hidden states
+        # The model output should be IntermediateTensors for non-last stages,
+        # or raw hidden states tensor for the last stage
+        if isinstance(model_output, IntermediateTensors):
+            # For intermediate stages, extract the residual/hidden_states tensor
+            output_hidden_states = model_output.tensors.get("residual")
+            if output_hidden_states is None:
+                output_hidden_states = model_output.tensors.get("hidden_states")
+            if output_hidden_states is None:
+                # Fallback: get the first tensor value
+                tensor_values = list(model_output.tensors.values())
+                if tensor_values:
+                    output_hidden_states = tensor_values[0]
+                else:
+                    raise RuntimeError(
+                        f"External PP stage {get_pp_group().rank_in_group}: "
+                        "Model output IntermediateTensors is empty"
+                    )
+        else:
+            # Raw tensor output (shouldn't happen for intermediate stages, but handle it)
+            output_hidden_states = model_output
+        
+        # Ensure output is a tensor
+        if not isinstance(output_hidden_states, torch.Tensor):
+            raise RuntimeError(
+                f"External PP stage {get_pp_group().rank_in_group}: "
+                f"Expected tensor output, got {type(output_hidden_states)}"
+            )
+        
+        # Package for next stage (or return path)
+        # Move tensors to CPU before returning to avoid RPC serialization issues
+        # The ZeroMQ communicator will handle moving them to the correct device
+        is_last = get_pp_group().is_last_rank
+        if is_last:
+            # Last stage: return final hidden states to stage 0
+            # DEBUG: Log output_hidden_states statistics before sending
+            stage_idx = get_pp_group().rank_in_group
+            logger.info(
+                f"Stage {stage_idx} [DEBUG] (last): About to send output_hidden_states - "
+                f"shape={output_hidden_states.shape}, dtype={output_hidden_states.dtype}, "
+                f"device={output_hidden_states.device}, "
+                f"mean={output_hidden_states.float().mean().item():.6f}, "
+                f"std={output_hidden_states.float().std().item():.6f}, "
+                f"min={output_hidden_states.float().min().item():.6f}, "
+                f"max={output_hidden_states.float().max().item():.6f}, "
+                f"step_type={step_type}, num_tokens={num_tokens}, "
+                f"num_reqs={num_reqs}, logits_indices={logits_indices}"
+            )
+            
+            return_tensor_dict = {
+                "hidden_states": output_hidden_states.cpu(),
+                "step_type": step_type,
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
+                "request_ids": request_ids,
+                "logits_indices": logits_indices,
+            }
+            
+            # DEBUG: Log after moving to CPU
+            logger.info(
+                f"Stage {stage_idx} [DEBUG] (last): After CPU move - "
+                f"hidden_states shape={return_tensor_dict['hidden_states'].shape}, "
+                f"device={return_tensor_dict['hidden_states'].device}"
+            )
+            
+            logger.debug(
+                f"External PP stage {get_pp_group().rank_in_group} (last): "
+                f"Prepared return tensor dict with hidden_states shape {output_hidden_states.shape}"
+            )
+            return return_tensor_dict
+        else:
+            # Intermediate stage: forward to next stage
+            forward_tensor_dict = {
+                "hidden_states": output_hidden_states.cpu(),
+                "step_type": step_type,
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs,
+                "request_ids": request_ids,
+                "logits_indices": logits_indices,
+            }
+            # Include any other tensors that need to be forwarded (move to CPU)
+            for key, value in tensor_dict.items():
+                if key not in forward_tensor_dict and isinstance(value, torch.Tensor):
+                    forward_tensor_dict[key] = value.cpu()
+            
+            logger.debug(
+                f"External PP stage {get_pp_group().rank_in_group}: "
+                f"Prepared forward tensor dict with hidden_states shape {output_hidden_states.shape}"
+            )
+            return forward_tensor_dict
+
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2914,6 +3844,16 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        
+        # DEBUG: Log sampled tokens (only for Stage 0 in external PP mode)
+        if hasattr(self, 'parallel_config') and getattr(get_pp_group(), 'is_first_rank', False):
+            if hasattr(sampler_output, 'sampled_token_ids') and sampler_output.sampled_token_ids is not None:
+                sampled_ids = sampler_output.sampled_token_ids
+                logger.info(
+                    f"Stage 0 [DEBUG]: Sampled token IDs - "
+                    f"shape={sampled_ids.shape if hasattr(sampled_ids, 'shape') else 'N/A'}, "
+                    f"values={sampled_ids.cpu().tolist() if hasattr(sampled_ids, 'cpu') else sampled_ids}"
+                )
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3871,6 +4811,25 @@ class GPUModelRunner(
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
+            
+            # In external PP mode, stage_0 may return IntermediateTensors instead of tensor
+            # Extract the actual tensor from IntermediateTensors if needed
+            from vllm.sequence import IntermediateTensors
+            if isinstance(hidden_states, IntermediateTensors):
+                # Extract hidden_states tensor from IntermediateTensors
+                if "hidden_states" in hidden_states.tensors:
+                    hidden_states = hidden_states.tensors["hidden_states"]
+                elif "residual" in hidden_states.tensors:
+                    hidden_states = hidden_states.tensors["residual"]
+                else:
+                    # Fallback: get the first tensor value
+                    tensor_values = list(hidden_states.tensors.values())
+                    if tensor_values:
+                        hidden_states = tensor_values[0]
+                    else:
+                        raise RuntimeError(
+                            "Model returned empty IntermediateTensors in _dummy_run"
+                        )
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
@@ -3910,11 +4869,16 @@ class GPUModelRunner(
     @torch.inference_mode()
     def _dummy_sampler_run(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         # The dummy hidden states may contain special values,
         # like `inf` or `nan`.
         # To avoid breaking the sampler, we use a random tensor here instead.
+        if hidden_states is None:
+            raise RuntimeError(
+                "hidden_states is None in _dummy_sampler_run. "
+                "This should not happen - check _dummy_run return value."
+            )
         hidden_states = torch.rand_like(hidden_states)
 
         logits = self.model.compute_logits(hidden_states)
@@ -4143,7 +5107,15 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
-        if get_pp_group().is_last_rank:
+        # In external PP mode, logits_processor is on is_first_rank (stage_0)
+        # In internal PP mode, it's on is_last_rank
+        pp_group = get_pp_group()
+        should_compute_logits = (
+            pp_group.is_first_rank
+            if self.parallel_config.pipeline_stage_mode == "external"
+            else pp_group.is_last_rank
+        )
+        if should_compute_logits:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:

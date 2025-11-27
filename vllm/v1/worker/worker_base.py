@@ -138,6 +138,24 @@ class WorkerBase:
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
+    
+    def execute_external_pipeline_step(
+        self, tensor_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute one pipeline step for external PP stages (non-stage-0).
+        
+        This method is called by external PP workers to process a tensor_dict
+        received from the previous stage, run local layers, and return updated
+        tensor_dict for the next stage (or return path for last stage).
+        
+        Args:
+            tensor_dict: Dictionary containing hidden states and metadata from
+                previous stage.
+        
+        Returns:
+            Updated tensor_dict with processed hidden states.
+        """
+        raise NotImplementedError
 
     def get_cache_block_size_bytes(self) -> int:
         """Return the size of a single cache block, in bytes. Used in

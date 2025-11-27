@@ -657,6 +657,24 @@ def make_layers(
         start_layer, end_layer = config.model_config.get_layers_start_end_indices(
             config.parallel_config
         )
+        # Validate layer range for external PP
+        if start_layer < 0 or end_layer > num_hidden_layers:
+            raise ValueError(
+                f"Invalid layer range for external PP stage "
+                f"{config.parallel_config.pipeline_stage_idx}: "
+                f"[{start_layer}, {end_layer}) is out of bounds "
+                f"[0, {num_hidden_layers})"
+            )
+        if start_layer >= end_layer:
+            raise ValueError(
+                f"Invalid layer range for external PP stage "
+                f"{config.parallel_config.pipeline_stage_idx}: "
+                f"start_layer ({start_layer}) >= end_layer ({end_layer})"
+            )
+        logger.debug(
+            f"External PP stage {config.parallel_config.pipeline_stage_idx}: "
+            f"layers [{start_layer}, {end_layer}) out of {num_hidden_layers} total"
+        )
     else:
         start_layer, end_layer = get_pp_indices(
             num_hidden_layers,
