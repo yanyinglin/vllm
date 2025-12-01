@@ -1418,7 +1418,7 @@ class ModelConfig:
                     # Log for debugging
                     import logging
                     logger = logging.getLogger(__name__)
-                    logger.info(
+                    logger.debug(
                         f"External PP stage {parallel_config.pipeline_stage_idx}: "
                         f"Detected _pipeline_info in config, using all {local_num_hidden_layers} local layers "
                         f"(range [0, {local_num_hidden_layers}))"

@@ -70,89 +70,8 @@ def is_ccache_available() -> bool:
     return which("ccache") is not None
 
 
-def find_ninja() -> tuple[bool, str | None]:
-    """
-    Find ninja build tool and return (available, path).
-    Returns (True, None) if ninja is in PATH, (True, path) if found from package,
-    or (False, None) if not available.
-    """
-    # First check if ninja is in PATH
-    ninja_cmd = which("ninja")
-    if ninja_cmd is not None:
-        # Verify ninja actually works by trying to run it
-        try:
-            result = subprocess.run(
-                ["ninja", "--version"],
-                capture_output=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                return (True, None)  # In PATH, no need for explicit path
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-    
-    # If not in PATH, try to find it from the ninja Python package
-    try:
-        import ninja
-        
-        # Try to use ninja's bin_path() method if available
-        if hasattr(ninja, "bin_path"):
-            ninja_path = Path(ninja.bin_path())
-            if ninja_path.exists() and ninja_path.is_file():
-                try:
-                    result = subprocess.run(
-                        [str(ninja_path), "--version"],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                    if result.returncode == 0:
-                        return (True, str(ninja_path))
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
-        
-        # Fallback: try common locations
-        try:
-            ninja_pkg_path = Path(ninja.__file__).parent
-        except AttributeError:
-            # ninja might be a namespace package
-            import importlib.util
-            spec = importlib.util.find_spec("ninja")
-            if spec and spec.origin:
-                ninja_pkg_path = Path(spec.origin).parent
-            else:
-                ninja_pkg_path = None
-        
-        if ninja_pkg_path:
-            # The ninja binary is typically in the package's data/bin directory
-            possible_paths = [
-                ninja_pkg_path / "data" / "bin" / "ninja",
-                ninja_pkg_path / "bin" / "ninja",
-                ninja_pkg_path.parent / "ninja" / "data" / "bin" / "ninja",
-            ]
-            
-            for ninja_path in possible_paths:
-                if ninja_path.exists() and ninja_path.is_file():
-                    # Verify it works
-                    try:
-                        result = subprocess.run(
-                            [str(ninja_path), "--version"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        if result.returncode == 0:
-                            return (True, str(ninja_path))
-                    except (subprocess.TimeoutExpired, OSError):
-                        continue
-    except ImportError:
-        pass
-    
-    return (False, None)
-
-
 def is_ninja_available() -> bool:
-    """Check if ninja is available."""
-    available, _ = find_ninja()
-    return available
+    return which("ninja") is not None
 
 
 class CMakeExtension(Extension):
@@ -255,39 +174,7 @@ class cmake_build_ext(build_ext):
         # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
         fc_base_dir = os.path.join(ROOT_DIR, ".deps")
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        
-        # Ensure the .deps directory exists and is writable for caching dependencies
-        # This directory caches CMake FetchContent downloads (e.g., CUTLASS) across builds
-        try:
-            os.makedirs(fc_base_dir, exist_ok=True)
-            # Test write access
-            test_file = os.path.join(fc_base_dir, ".write_test")
-            try:
-                with open(test_file, 'w') as f:
-                    f.write("test")
-                os.remove(test_file)
-            except (OSError, IOError):
-                logger.warning(
-                    "Warning: .deps directory is not writable. "
-                    "Dependencies may not be cached properly. "
-                    "Path: %s", fc_base_dir
-                )
-        except (OSError, IOError) as e:
-            logger.warning(
-                "Warning: Could not create .deps directory for dependency caching. "
-                "Dependencies will be re-downloaded on each build. "
-                "Path: %s, Error: %s", fc_base_dir, e
-            )
-        
         cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
-        
-        # Log dependency cache location for user awareness
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "Using dependency cache directory: %s "
-                "(CMake FetchContent dependencies will be cached here)",
-                fc_base_dir
-            )
 
         #
         # Setup parallelism and build tool
@@ -297,18 +184,12 @@ class cmake_build_ext(build_ext):
         if nvcc_threads:
             cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
 
-        ninja_available, ninja_path = find_ninja()
-        if ninja_available:
+        if is_ninja_available():
             build_tool = ["-G", "Ninja"]
             cmake_args += [
                 "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
                 "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
-            # If ninja was found from package (not in PATH), tell CMake where it is
-            if ninja_path is not None:
-                cmake_args += ["-DCMAKE_MAKE_PROGRAM={}".format(ninja_path)]
-                # Also add to PATH for subprocess calls
-                os.environ["PATH"] = str(Path(ninja_path).parent) + os.pathsep + os.environ.get("PATH", "")
         else:
             # Default build tool to whatever cmake picks.
             build_tool = []
@@ -337,26 +218,6 @@ class cmake_build_ext(build_ext):
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
-        
-        # Print helpful information about dependency caching
-        deps_dir = os.path.join(ROOT_DIR, ".deps")
-        if os.path.exists(deps_dir):
-            logger.info(
-                "Using dependency cache at %s - CMake FetchContent dependencies "
-                "(e.g., CUTLASS) are cached here and will be reused across builds.",
-                deps_dir
-            )
-        else:
-            logger.info(
-                "Dependency cache directory will be created at %s - "
-                "CMake FetchContent dependencies will be cached here for future builds.",
-                deps_dir
-            )
-        
-        # Note: Python build dependencies (cmake, ninja, torch, etc.) are managed by pip.
-        # To avoid re-downloading them on each build, you can use:
-        #   pip install -e . --no-build-isolation
-        # This installs build dependencies in your current environment instead of a temporary one.
 
         targets = []
 
@@ -377,41 +238,7 @@ class cmake_build_ext(build_ext):
             *[f"--target={name}" for name in targets],
         ]
 
-        # Run the build and capture output for better error reporting
-        # Use check=False to handle errors manually with better messages
-        result = subprocess.run(
-            ["cmake", *build_args],
-            cwd=self.build_temp,
-            capture_output=True,
-            text=True,
-        )
-        
-        # Always print stdout so user sees build progress
-        if result.stdout:
-            print(result.stdout, end='', flush=True)
-        
-        if result.returncode != 0:
-            # Build failed - show error details
-            logger.error("CMake build failed with return code %d", result.returncode)
-            if result.stderr:
-                logger.error("Build errors:\n%s", result.stderr)
-            # Also check if there are errors in stdout (ninja outputs errors to stdout)
-            if result.stdout:
-                # Extract error lines (lines containing "error:" or "Error" or "failed")
-                error_lines = [
-                    line for line in result.stdout.split('\n')
-                    if any(keyword in line.lower() for keyword in ['error:', 'failed', 'fatal error'])
-                ]
-                if error_lines:
-                    logger.error("Detected errors in build output:")
-                    for line in error_lines[-20:]:  # Show last 20 error lines
-                        logger.error("  %s", line)
-            
-            raise RuntimeError(
-                f"Failed to build extensions. "
-                f"Return code: {result.returncode}. "
-                f"See error messages above for details."
-            )
+        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
 
         # Install the libraries
         for ext in self.extensions:

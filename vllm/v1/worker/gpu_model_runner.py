@@ -3188,22 +3188,22 @@ class GPUModelRunner(
             ):
                 # DEBUG: Log model layer configuration
                 if hasattr(self.model, 'model') and hasattr(self.model.model, 'start_layer'):
-                    logger.info(
-                        f"Stage 0 [DEBUG]: Model layer config - "
+                    logger.debug(
+                        f"Stage 0: Model layer config - "
                         f"start_layer={self.model.model.start_layer}, "
                         f"end_layer={self.model.model.end_layer}, "
                         f"num_layers={len(self.model.model.layers) if hasattr(self.model.model, 'layers') else 'N/A'}"
                     )
                 elif hasattr(self.model, 'start_layer'):
-                    logger.info(
-                        f"Stage 0 [DEBUG]: Model layer config - "
+                    logger.debug(
+                        f"Stage 0: Model layer config - "
                         f"start_layer={self.model.start_layer}, "
                         f"end_layer={self.model.end_layer}, "
                         f"num_layers={len(self.model.layers) if hasattr(self.model, 'layers') else 'N/A'}"
                     )
                 else:
-                    logger.info(
-                        f"Stage 0 [DEBUG]: Model layer config - "
+                    logger.debug(
+                        f"Stage 0: Model layer config - "
                         f"model type={type(self.model)}, "
                         f"hasattr model.model={hasattr(self.model, 'model')}"
                     )
@@ -3224,13 +3224,13 @@ class GPUModelRunner(
                 is_prefill = num_scheduled_tokens > num_reqs
                 
                 # DEBUG: Log IntermediateTensors contents
-                logger.info(
-                    f"Stage 0 [DEBUG]: IntermediateTensors keys: {list(hidden_states.tensors.keys())}, "
+                logger.debug(
+                    f"Stage 0: IntermediateTensors keys: {list(hidden_states.tensors.keys())}, "
                     f"step_type={'prefill' if is_prefill else 'decode'}"
                 )
                 for key, tensor in hidden_states.tensors.items():
-                    logger.info(
-                        f"Stage 0 [DEBUG]: IntermediateTensors['{key}'] - "
+                    logger.debug(
+                        f"Stage 0: IntermediateTensors['{key}'] - "
                         f"shape={tensor.shape}, dtype={tensor.dtype}, "
                         f"mean={tensor.float().mean().item():.6f}, "
                         f"std={tensor.float().std().item():.6f}, "
@@ -3260,8 +3260,8 @@ class GPUModelRunner(
                     )
                 
                 # DEBUG: Log hidden_states before sending
-                logger.info(
-                    f"Stage 0 [DEBUG]: About to send hidden_states to next stage - "
+                logger.debug(
+                    f"Stage 0: About to send hidden_states to next stage - "
                     f"shape={main_hidden_states.shape}, dtype={main_hidden_states.dtype}, "
                     f"device={main_hidden_states.device}, "
                     f"mean={main_hidden_states.float().mean().item():.6f}, "
@@ -3359,8 +3359,8 @@ class GPUModelRunner(
                     final_hidden_states = final_hidden_states.to(self.device)
                 
                 # DEBUG: Log received final_hidden_states statistics
-                logger.info(
-                    f"Stage 0 [DEBUG]: Received final_hidden_states - "
+                logger.debug(
+                    f"Stage 0: Received final_hidden_states - "
                     f"shape={final_hidden_states.shape}, dtype={final_hidden_states.dtype}, "
                     f"device={final_hidden_states.device}, "
                     f"mean={final_hidden_states.float().mean().item():.6f}, "
@@ -3368,8 +3368,8 @@ class GPUModelRunner(
                     f"min={final_hidden_states.float().min().item():.6f}, "
                     f"max={final_hidden_states.float().max().item():.6f}"
                 )
-                logger.info(
-                    f"Stage 0 [DEBUG]: Return tensor_dict keys: {list(return_tensor_dict.keys())}, "
+                logger.debug(
+                    f"Stage 0: Return tensor_dict keys: {list(return_tensor_dict.keys())}, "
                     f"step_type={return_tensor_dict.get('step_type', 'N/A')}, "
                     f"num_tokens={return_tensor_dict.get('num_tokens', 'N/A')}, "
                     f"logits_indices type={type(logits_indices)}, value={logits_indices}"
@@ -3383,8 +3383,8 @@ class GPUModelRunner(
                     sample_hidden_states = final_hidden_states[logits_indices]
                 
                 # DEBUG: Log sample_hidden_states statistics
-                logger.info(
-                    f"Stage 0 [DEBUG]: Extracted sample_hidden_states - "
+                logger.debug(
+                    f"Stage 0: Extracted sample_hidden_states - "
                     f"shape={sample_hidden_states.shape}, dtype={sample_hidden_states.dtype}, "
                     f"device={sample_hidden_states.device}, "
                     f"mean={sample_hidden_states.float().mean().item():.6f}, "
@@ -3396,13 +3396,13 @@ class GPUModelRunner(
                 # DEBUG: Check lm_head before computing logits
                 if hasattr(self.model, 'lm_head'):
                     lm_head = self.model.lm_head
-                    logger.info(
-                        f"Stage 0 [DEBUG]: lm_head type={type(lm_head)}, "
+                    logger.debug(
+                        f"Stage 0: lm_head type={type(lm_head)}, "
                         f"hasattr(weight)={hasattr(lm_head, 'weight')}"
                     )
                     if hasattr(lm_head, 'weight') and lm_head.weight is not None:
-                        logger.info(
-                            f"Stage 0 [DEBUG]: lm_head.weight - "
+                        logger.debug(
+                            f"Stage 0: lm_head.weight - "
                             f"shape={lm_head.weight.shape}, dtype={lm_head.weight.dtype}, "
                             f"device={lm_head.weight.device}, "
                             f"mean={lm_head.weight.float().mean().item():.6f}, "
@@ -3411,19 +3411,19 @@ class GPUModelRunner(
                             f"max={lm_head.weight.float().max().item():.6f}"
                         )
                     if hasattr(self.model, 'logits_processor'):
-                        logger.info(
-                            f"Stage 0 [DEBUG]: logits_processor exists={self.model.logits_processor is not None}, "
+                        logger.debug(
+                            f"Stage 0: logits_processor exists={self.model.logits_processor is not None}, "
                             f"type={type(self.model.logits_processor) if self.model.logits_processor else None}"
                         )
                 else:
-                    logger.warning("Stage 0 [DEBUG]: model.lm_head does not exist!")
+                    logger.debug("Stage 0: model.lm_head does not exist!")
                 
                 # Compute logits from final hidden states
                 logits = self.model.compute_logits(sample_hidden_states)
                 
                 # DEBUG: Log computed logits statistics
-                logger.info(
-                    f"Stage 0 [DEBUG]: Computed logits - "
+                logger.debug(
+                    f"Stage 0: Computed logits - "
                     f"shape={logits.shape}, dtype={logits.dtype}, "
                     f"device={logits.device}, "
                     f"mean={logits.float().mean().item():.6f}, "
@@ -3436,8 +3436,8 @@ class GPUModelRunner(
                     first_token_logits = logits[0] if logits.dim() > 1 else logits
                     if first_token_logits.numel() > 5:
                         top_k_values, top_k_indices = torch.topk(first_token_logits.float(), k=min(5, first_token_logits.numel()))
-                        logger.info(
-                            f"Stage 0 [DEBUG]: Top-5 logits values for first token: "
+                        logger.debug(
+                            f"Stage 0: Top-5 logits values for first token: "
                             f"indices={top_k_indices.cpu().tolist()}, "
                             f"values={top_k_values.cpu().tolist()}"
                         )
@@ -3747,8 +3747,8 @@ class GPUModelRunner(
             # Last stage: return final hidden states to stage 0
             # DEBUG: Log output_hidden_states statistics before sending
             stage_idx = get_pp_group().rank_in_group
-            logger.info(
-                f"Stage {stage_idx} [DEBUG] (last): About to send output_hidden_states - "
+            logger.debug(
+                f"Stage {stage_idx} (last): About to send output_hidden_states - "
                 f"shape={output_hidden_states.shape}, dtype={output_hidden_states.dtype}, "
                 f"device={output_hidden_states.device}, "
                 f"mean={output_hidden_states.float().mean().item():.6f}, "
@@ -3769,8 +3769,8 @@ class GPUModelRunner(
             }
             
             # DEBUG: Log after moving to CPU
-            logger.info(
-                f"Stage {stage_idx} [DEBUG] (last): After CPU move - "
+            logger.debug(
+                f"Stage {stage_idx} (last): After CPU move - "
                 f"hidden_states shape={return_tensor_dict['hidden_states'].shape}, "
                 f"device={return_tensor_dict['hidden_states'].device}"
             )
@@ -3849,8 +3849,8 @@ class GPUModelRunner(
         if hasattr(self, 'parallel_config') and getattr(get_pp_group(), 'is_first_rank', False):
             if hasattr(sampler_output, 'sampled_token_ids') and sampler_output.sampled_token_ids is not None:
                 sampled_ids = sampler_output.sampled_token_ids
-                logger.info(
-                    f"Stage 0 [DEBUG]: Sampled token IDs - "
+                logger.debug(
+                    f"Stage 0: Sampled token IDs - "
                     f"shape={sampled_ids.shape if hasattr(sampled_ids, 'shape') else 'N/A'}, "
                     f"values={sampled_ids.cpu().tolist() if hasattr(sampled_ids, 'cpu') else sampled_ids}"
                 )
