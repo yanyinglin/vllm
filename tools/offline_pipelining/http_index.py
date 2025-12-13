@@ -53,7 +53,7 @@ class PipelineManager:
         pipeline_dir: str,
         num_stages: int,
         base_port: int = 15550,
-        api_port: int = 8000,
+        api_port: int = 5000,
         gpu_ids: List[int] = None,
         vllm_source_dir: Optional[str] = None,
     ):
@@ -90,7 +90,21 @@ class PipelineManager:
         return "vllm serve"
     
     def _build_stage_command(self, stage_idx: int) -> List[str]:
-        """Build command for a pipeline stage"""
+        """Build command for a pipeline stage using bind mode architecture.
+        
+        Each stage only needs to know:
+        - Its own IP and port (for binding)
+        - Previous stage's IP and port (for connecting PULL socket)
+        - Last stage's IP and port (Stage 0 for return path)
+        
+        Bind mode:
+        - PUSH sockets bind to ports (senders)
+        - PULL sockets connect to Service addresses (receivers)
+        - This allows Kubernetes Service load balancing
+        
+        Forward path: stage_i binds PUSH, stage_{i+1} connects PULL
+        Return path: last stage binds PUSH, stage 0 connects PULL
+        """
         is_first = (stage_idx == 0)
         is_last = (stage_idx == self.num_stages - 1)
         
@@ -105,36 +119,38 @@ class PipelineManager:
             "--tensor-parallel-size", "1",
         ])
         
-        # Set next stage address (except for last stage)
+        # Forward path: stage_i binds PUSH, stage_{i+1} connects PULL
         if not is_last:
-            next_port = self.base_port + stage_idx
+            # Non-last stages: bind PUSH socket to local port on this stage's IP
+            bind_port = self.base_port + stage_idx
+            cmd.extend([
+                "--pipeline-local-bind-port",
+                str(bind_port),
+            ])
+        
+        if not is_first:
+            # Non-first stages: connect PULL socket to previous stage's PUSH Service
+            prev_bind_port = self.base_port + stage_idx - 1
             cmd.extend([
                 "--pipeline-next-stage-addr",
-                f"{self.local_ip}:{next_port}",
+                f"{self.local_ip}:{prev_bind_port}",
             ])
         
-        # Set local listen port
-        if not is_first:
-            # Non-first stages: listen on forward path port
-            listen_port = self.base_port + stage_idx - 1
+        # Return path: last stage binds PUSH, stage 0 connects PULL
+        if is_last and not is_first:
+            # Last stage: bind PUSH socket for return path on this stage's IP
+            return_bind_port = self.base_port + self.num_stages
             cmd.extend([
-                "--pipeline-local-listen-port",
-                str(listen_port),
-            ])
-        elif is_first and not is_last:
-            # Stage 0: listen on return port
-            return_port = self.base_port + self.num_stages
-            cmd.extend([
-                "--pipeline-local-listen-port",
-                str(return_port),
+                "--pipeline-local-bind-port",
+                str(return_bind_port),
             ])
         
-        # Last stage needs prev_stage_addr for return path
-        if is_last:
-            return_port = self.base_port + self.num_stages
+        if is_first and not is_last:
+            # Stage 0: connect PULL socket to last stage's return Service
+            return_bind_port = self.base_port + self.num_stages
             cmd.extend([
                 "--pipeline-prev-stage-addr",
-                f"{self.local_ip}:{return_port}",
+                f"{self.local_ip}:{return_bind_port}",
             ])
         
         # Stage 0 exposes HTTP API; others are external PP workers
@@ -145,13 +161,15 @@ class PipelineManager:
         
         return cmd
     
-    def launch_stages(self):
-        """Launch all pipeline stages"""
+    def launch_stages(self, single_stage_idx: Optional[int] = None):
+        """Launch all pipeline stages or a single stage"""
         print("=" * 50)
         print("ZeroMQ Pipeline Parallelism HTTP Entry Point")
         print("=" * 50)
         print(f"Pipeline Directory: {self.pipeline_dir}")
         print(f"Number of Stages: {self.num_stages}")
+        if single_stage_idx is not None:
+            print(f"Single Stage Mode: Launching only stage {single_stage_idx}")
         print(f"Local IP: {self.local_ip}")
         print(f"Base ZeroMQ Port: {self.base_port}")
         print(f"API Port: {self.api_port}")
@@ -161,17 +179,26 @@ class PipelineManager:
         print("=" * 50)
         print()
         
-        for stage_idx in range(self.num_stages):
-            self._launch_stage(stage_idx)
-            time.sleep(3)  # Wait between launches
+        if single_stage_idx is not None:
+            if single_stage_idx < 0 or single_stage_idx >= self.num_stages:
+                raise ValueError(f"Invalid stage index: {single_stage_idx} (must be 0-{self.num_stages-1})")
+            self._launch_stage(single_stage_idx)
+        else:
+            for stage_idx in range(self.num_stages):
+                self._launch_stage(stage_idx)
+                time.sleep(3)  # Wait between launches
         
         print()
         print("=" * 50)
-        print("All stages launched successfully!")
+        if single_stage_idx is not None:
+            print(f"Stage {single_stage_idx} launched successfully!")
+        else:
+            print("All stages launched successfully!")
         print("=" * 50)
         print(f"Stage PIDs: {self.stage_pids}")
         print(f"Logs directory: {self.log_dir}")
-        print(f"API endpoint: http://localhost:{self.api_port}")
+        if single_stage_idx is None or single_stage_idx == 0:
+            print(f"API endpoint: http://localhost:{self.api_port}")
         print()
     
     def _launch_stage(self, stage_idx: int):
@@ -188,18 +215,18 @@ class PipelineManager:
         print(f"  Log: {log_file}")
         print(f"  GPU: {gpu_id}")
         
-        if not is_first:
-            listen_port = self.base_port + stage_idx - 1
-            print(f"  Forward Listen Port: {listen_port} (receives from stage {stage_idx - 1})")
-        if is_first and not is_last:
-            return_port = self.base_port + self.num_stages
-            print(f"  Return Listen Port: {return_port} (receives final results from last stage)")
         if not is_last:
-            next_port = self.base_port + stage_idx
-            print(f"  Next Stage: {self.local_ip}:{next_port}")
-        if is_last:
-            return_port = self.base_port + self.num_stages
-            print(f"  Return Address: {self.local_ip}:{return_port} (sends final results to stage 0)")
+            bind_port = self.base_port + stage_idx
+            print(f"  Forward Bind Port: {bind_port} (PUSH socket binds, allows next stage to connect)")
+        if not is_first:
+            prev_bind_port = self.base_port + stage_idx - 1
+            print(f"  Previous Stage Service: {self.local_ip}:{prev_bind_port} (PULL socket connects)")
+        if is_last and not is_first:
+            return_bind_port = self.base_port + self.num_stages
+            print(f"  Return Bind Port: {return_bind_port} (PUSH socket binds for return path)")
+        if is_first and not is_last:
+            return_bind_port = self.base_port + self.num_stages
+            print(f"  Return Service: {self.local_ip}:{return_bind_port} (PULL socket connects to last stage)")
         if is_first:
             print(f"  API Port: {self.api_port}")
         else:
@@ -390,26 +417,26 @@ def main():
     parser.add_argument(
         "--pipeline-dir",
         type=str,
-        required=True,
+        default=None,
         help="Directory containing pipeline stages",
     )
     parser.add_argument(
         "--num-stages",
         type=int,
-        required=True,
+        default=None,
         help="Number of pipeline stages",
     )
     parser.add_argument(
         "--base-port",
         type=int,
-        default=15550,
+        default=None,
         help="Starting ZeroMQ port (default: 15550)",
     )
     parser.add_argument(
         "--api-port",
         type=int,
-        default=8000,
-        help="HTTP API port for stage 0 (default: 8000)",
+        default=None,
+        help="HTTP API port for stage 0 (default: 5000)",
     )
     parser.add_argument(
         "--gpu-ids",
@@ -420,13 +447,13 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="127.0.0.1",
+        default=None,
         help="Host to bind HTTP server (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
+        default=None,
         help="Port for HTTP entry point server (default: 8080)",
     )
     parser.add_argument(
@@ -435,24 +462,67 @@ def main():
         default=None,
         help="vLLM source directory (optional, for source mode)",
     )
+    parser.add_argument(
+        "--single-stage-idx",
+        type=int,
+        default=None,
+        help="Launch only a single stage (for distributed deployment)",
+    )
     
     args = parser.parse_args()
     
+    # Read from environment variables if not provided via command line
+    pipeline_dir = args.pipeline_dir or os.environ.get("PIPELINE_DIR")
+    num_stages = args.num_stages
+    if num_stages is None:
+        num_stages_str = os.environ.get("NUM_STAGES")
+        if num_stages_str:
+            num_stages = int(num_stages_str)
+    
+    base_port = args.base_port
+    if base_port is None:
+        base_port_str = os.environ.get("BASE_PORT", "15550")
+        base_port = int(base_port_str)
+    
+    api_port = args.api_port
+    if api_port is None:
+        api_port_str = os.environ.get("API_PORT", "5000")
+        api_port = int(api_port_str)
+    
+    gpu_ids_str = args.gpu_ids or os.environ.get("GPU_IDS")
+    host = args.host or os.environ.get("HOST", "127.0.0.1")
+    port = args.port
+    if port is None:
+        port_str = os.environ.get("PORT", "8080")
+        port = int(port_str)
+    
+    single_stage_idx = args.single_stage_idx
+    if single_stage_idx is None:
+        single_stage_idx_str = os.environ.get("PIPELINE_STAGE_IDX")
+        if single_stage_idx_str:
+            single_stage_idx = int(single_stage_idx_str)
+    
+    # Validate required arguments
+    if pipeline_dir is None:
+        raise ValueError("--pipeline-dir or PIPELINE_DIR environment variable is required")
+    if num_stages is None:
+        raise ValueError("--num-stages or NUM_STAGES environment variable is required")
+    
     # Parse GPU IDs
-    if args.gpu_ids:
-        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+    if gpu_ids_str:
+        gpu_ids = [int(x.strip()) for x in gpu_ids_str.split(",")]
     else:
-        gpu_ids = list(range(args.num_stages))
+        gpu_ids = list(range(num_stages))
     
     # Check VLLM_SOURCE_DIR environment variable
     vllm_source_dir = args.vllm_source_dir or os.environ.get("VLLM_SOURCE_DIR")
     
     # Create pipeline manager
     pipeline_manager = PipelineManager(
-        pipeline_dir=args.pipeline_dir,
-        num_stages=args.num_stages,
-        base_port=args.base_port,
-        api_port=args.api_port,
+        pipeline_dir=pipeline_dir,
+        num_stages=num_stages,
+        base_port=base_port,
+        api_port=api_port,
         gpu_ids=gpu_ids,
         vllm_source_dir=vllm_source_dir,
     )
@@ -470,25 +540,45 @@ def main():
     
     # Launch pipeline stages
     try:
-        pipeline_manager.launch_stages()
+        pipeline_manager.launch_stages(single_stage_idx=single_stage_idx)
         
-        # Wait for stage 0 to be ready
-        pipeline_manager.wait_for_stage0_ready()
+        # Wait for stage 0 to be ready (only if stage 0 is launched)
+        if single_stage_idx is None or single_stage_idx == 0:
+            pipeline_manager.wait_for_stage0_ready()
         
-        # Create and run HTTP server
-        app = create_app(pipeline_manager)
-        
-        print("=" * 50)
-        print("HTTP Entry Point Server Starting")
-        print("=" * 50)
-        print(f"Server URL: http://{args.host}:{args.port}")
-        print(f"Stage 0 API: http://localhost:{args.api_port}")
-        print("=" * 50)
-        print()
-        print("Press Ctrl+C to stop all stages")
-        print()
-        
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        # Create and run HTTP server (only for stage 0 or all stages mode)
+        if single_stage_idx is None or single_stage_idx == 0:
+            app = create_app(pipeline_manager)
+            
+            print("=" * 50)
+            print("HTTP Entry Point Server Starting")
+            print("=" * 50)
+            print(f"Server URL: http://{host}:{port}")
+            print(f"Stage 0 API: http://localhost:{api_port}")
+            print("=" * 50)
+            print()
+            print("Press Ctrl+C to stop all stages")
+            print()
+            
+            uvicorn.run(app, host=host, port=port, log_level="info")
+        else:
+            # For non-stage-0 workers, just keep the process running
+            print("=" * 50)
+            print(f"Stage {single_stage_idx} worker running")
+            print("=" * 50)
+            print("Press Ctrl+C to stop")
+            print()
+            
+            # Keep process alive
+            try:
+                while True:
+                    time.sleep(1)
+                    # Check if process is still running
+                    if pipeline_manager.processes and pipeline_manager.processes[0].poll() is not None:
+                        print(f"Stage {single_stage_idx} process exited")
+                        break
+            except KeyboardInterrupt:
+                pass
         
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -503,5 +593,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -391,6 +391,7 @@ class EngineArgs:
     pipeline_next_stage_addr: str | None = ParallelConfig.pipeline_next_stage_addr
     pipeline_prev_stage_addr: str | None = ParallelConfig.pipeline_prev_stage_addr
     pipeline_local_listen_port: int | None = ParallelConfig.pipeline_local_listen_port
+    pipeline_local_bind_port: int | None = ParallelConfig.pipeline_local_bind_port
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -802,6 +803,12 @@ class EngineArgs:
             type=int,
             default=None,
             help="Local port to bind for receiving data from previous stage in external mode",
+        )
+        parallel_group.add_argument(
+            "--pipeline-local-bind-port",
+            type=int,
+            default=None,
+            help="Local port to bind for PUSH socket in bind mode, allowing multiple receivers to connect via Service in external mode",
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
@@ -1692,6 +1699,7 @@ class EngineArgs:
             pipeline_next_stage_addr=self.pipeline_next_stage_addr,
             pipeline_prev_stage_addr=self.pipeline_prev_stage_addr,
             pipeline_local_listen_port=self.pipeline_local_listen_port,
+            pipeline_local_bind_port=self.pipeline_local_bind_port,
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,

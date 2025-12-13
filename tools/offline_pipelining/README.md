@@ -6,25 +6,18 @@ Starting from commit `cbfc1eb`, we migrated pipeline parallelism data transmissi
 
 ## Changes Summary
 
-### Implementation Approaches
+### Implementation Approach
 
-There are **two different approaches** to using ZeroMQ for pipeline parallelism:
-
-1. **Monkey Patching Approach** (No core code changes required)
-   - Used by `test_pipeline_engine.py`
-   - Intercepts `get_pp_group()` calls via monkey patching
-   - All ZeroMQ code is in `tools/offline_pipelining/` directory
-   - **No modifications to vLLM core files**
-
-2. **External Pipeline Mode** (Core code modifications)
-   - Added in commit `83e77c4cb`
-   - Integrated into vLLM core with new configuration options
-   - Requires modifications to core vLLM files
-   - More robust but requires maintaining fork
+**External Pipeline Mode** (Core code modifications)
+- Added in commit `83e77c4cb`
+- Integrated into vLLM core with new configuration options
+- Requires modifications to core vLLM files
+- Uses Bind Mode architecture: PUSH sockets bind to ports, PULL sockets connect to addresses
+- More robust and maintainable long-term
 
 ### Key Files Added/Modified
 
-#### Tools Directory (No Core Changes Required)
+#### Tools Directory
 
 1. **`tools/offline_pipelining/zmq_communicator.py`** (NEW)
    - Implements `ZeroMQCommunicator` class
@@ -37,20 +30,14 @@ There are **two different approaches** to using ZeroMQ for pipeline parallelism:
    - Uses `ZeroMQCommunicator` for inter-stage communication
    - Supports multiprocess pipeline execution
 
-3. **`tools/offline_pipelining/test_pipeline_engine.py`** (NEW)
-   - Adds `setup_zeromq_pp_group()` function that monkey-patches vLLM's `get_pp_group()`
-   - Creates `ZeroMQPPGroup` wrapper to intercept pipeline communication calls
-   - Allows using ZeroMQ with vLLM engine **without modifying core inference code**
-   - Uses monkey patching to replace NCCL communication with ZeroMQ
-
-4. **`tools/offline_pipelining/serve_pipeline.py`** (NEW)
+3. **`tools/offline_pipelining/serve_pipeline.py`** (NEW)
    - Pipeline export tool for splitting models into stages
    - Exports each stage as HuggingFace format
 
-5. **`tools/offline_pipelining/test_model_zeromq.py`** (NEW)
+4. **`tools/offline_pipelining/test_model_zeromq.py`** (NEW)
    - Test tool for validating pipeline stages with vLLM engine
 
-6. **`tools/offline_pipelining/http_index.py`** (NEW)
+5. **`tools/offline_pipelining/http_index.py`** (NEW)
    - HTTP entry point for ZeroMQ pipeline parallelism
    - Launches all pipeline stages using external pipeline mode
    - Exposes HTTP server that forwards inference requests to stage 0
@@ -59,7 +46,7 @@ There are **two different approaches** to using ZeroMQ for pipeline parallelism:
 
 #### Core vLLM Files (Modified in commit `83e77c4cb`)
 
-**Note**: These modifications are for the "External Pipeline Mode" feature. The monkey patching approach in `test_pipeline_engine.py` does **NOT** require these changes.
+**Note**: These modifications are required for the "External Pipeline Mode" feature.
 
 1. **`vllm/v1/worker/gpu_model_runner.py`** (MODIFIED)
    - Added `execute_external_pipeline_step()` method for external PP stages
@@ -81,6 +68,7 @@ There are **two different approaches** to using ZeroMQ for pipeline parallelism:
      - `pipeline_next_stage_addr`: Next stage address (IP:port)
      - `pipeline_prev_stage_addr`: Previous stage address
      - `pipeline_local_listen_port`: Local listen port
+     - `pipeline_local_bind_port`: Local bind port for PUSH sockets (bind mode)
 
 4. **`vllm/distributed/parallel_state.py`** (MODIFIED)
    - Added support for external pipeline mode in parallel state management
@@ -111,15 +99,15 @@ Stage 0 (First)          Stage 1 (Middle)          Stage N (Last)
    |  (backward for tokens)    |                         |
 ```
 
-### ZeroMQ Socket Pattern
+### ZeroMQ Socket Pattern (Bind Mode)
 
 - **Forward direction**: PUSH/PULL sockets
-  - Stage i binds PUSH socket to port `zmq_ports[i]`
-  - Stage i+1 connects PULL socket to port `zmq_ports[i]`
+  - Stage i (non-last) binds PUSH socket to port `BASE_PORT + i`
+  - Stage i+1 connects PULL socket to `Stage_i_IP:BASE_PORT+i`
   
-- **Backward direction**: For autoregressive generation
-  - Last stage sends token IDs back to first stage
-  - Uses additional port range (base_port + 10000)
+- **Return direction**: For final results
+  - Last stage binds PUSH socket to port `BASE_PORT + NUM_STAGES`
+  - Stage 0 connects PULL socket to `Last_Stage_IP:BASE_PORT+NUM_STAGES`
 
 ### Data Serialization
 
@@ -135,36 +123,9 @@ Stage 0 (First)          Stage 1 (Middle)          Stage N (Last)
 4. **Cross-Device Support**: Can work with CPU-only stages or mixed CPU/GPU setups
 5. **Network Flexibility**: Can work over network (TCP) or local (IPC) connections
 
-## Implementation Analysis: Two Approaches Compared
+## Implementation Details
 
-### Approach 1: Monkey Patching (No Core Changes)
-
-**Used by**: `test_pipeline_engine.py`
-
-This approach uses **monkey patching** to intercept communication without modifying model inference code:
-
-1. **`test_pipeline_engine.py`** patches `vllm.distributed.parallel_state.get_pp_group()`:
-   ```python
-   def setup_zeromq_pp_group(stage_idx, num_stages, communicator):
-       zmq_pp_group = ZeroMQPPGroup(stage_idx, num_stages, communicator)
-       parallel_state_module._PP = zmq_pp_group
-       parallel_state_module.get_pp_group = lambda: zmq_pp_group
-   ```
-
-2. **`ZeroMQPPGroup`** implements the same interface as NCCL-based PP groups, intercepting `send_tensor_dict()` and `recv_tensor_dict()` calls.
-
-**Pros**:
-- ✅ No modifications to vLLM core files
-- ✅ Works with existing vLLM engine
-- ✅ Easy to maintain (all code in tools directory)
-- ✅ Can be used with any vLLM version (with minor adjustments)
-
-**Cons**:
-- ⚠️ Requires runtime patching
-- ⚠️ May break with vLLM updates (need to update patching logic)
-- ⚠️ Less integrated with vLLM's configuration system
-
-### Approach 2: External Pipeline Mode (Core Modifications)
+### External Pipeline Mode
 
 **Added in**: commit `83e77c4cb`
 
@@ -174,38 +135,15 @@ This approach integrates ZeroMQ support directly into vLLM core:
 2. Modified `gpu_model_runner.py` to handle external pipeline stages
 3. Created `vllm/distributed/device_communicators/zeromq_communicator.py`
 4. Added CLI arguments and configuration validation
+5. Uses Bind Mode architecture for flexible communication
 
-**Pros**:
+**Key Features**:
 - ✅ Fully integrated with vLLM configuration system
 - ✅ More robust and maintainable long-term
 - ✅ Better error handling and validation
 - ✅ Official support path
-
-**Cons**:
-- ⚠️ Requires maintaining a fork of vLLM
-- ⚠️ Need to merge/rebase with upstream vLLM updates
-- ⚠️ More complex to set up initially
-
-### Which Approach to Use?
-
-- **For offline pipeline testing/development**: Use **Approach 1 (Monkey Patching)** with `test_pipeline_engine.py`
-- **For production deployment**: Consider **Approach 2 (External Pipeline Mode)** if you can maintain a vLLM fork
-
-### Unnecessary Modifications Analysis
-
-The following modifications in `gpu_model_runner.py` are **necessary** for external pipeline mode but **not required** for monkey patching approach:
-
-1. **CPU tensor transfer** (line 3275): Required for ZeroMQ serialization
-   - Comment: `# Move to CPU for ZeroMQ serialization`
-   - **Necessary**: ZeroMQ requires CPU tensors for serialization
-
-2. **Error handling for ZeroMQ deserialization** (lines 3593-3596): Helpful for debugging
-   - **Necessary**: Catches deserialization issues early
-
-3. **Comments mentioning ZeroMQ** (line 3744): Documentation only
-   - **Optional**: Could be removed, but helpful for understanding
-
-**Conclusion**: For the monkey patching approach, **no core vLLM modifications are needed**. All ZeroMQ communication is handled through the monkey-patched `get_pp_group()` interface.
+- ✅ Bind Mode: PUSH sockets bind to ports, PULL sockets connect to addresses
+- ✅ Supports Kubernetes Service load balancing
 
 ## Usage
 
@@ -227,16 +165,6 @@ python tools/offline_pipelining/test_pipeline.py \
     --test-input "Hello, world!" \
     --device cuda \
     --multiprocess
-```
-
-### Run Pipeline with vLLM Engine (ZeroMQ - Monkey Patching)
-
-```bash
-python tools/offline_pipelining/test_pipeline_engine.py \
-    --pipeline-dir /path/to/pipeline \
-    --num-stages 4 \
-    --test-input "Hello, world!" \
-    --device cuda
 ```
 
 ### Run Pipeline with External Pipeline Mode (ZeroMQ - Core Integration)
@@ -263,16 +191,23 @@ This will:
 - Provide health check (`/health`) and pipeline status (`/pipeline/status`) endpoints
 - Handle graceful shutdown and cleanup
 
-**Option 2: Automated Test Script**
+**Key Design Principle**: Each stage is independent and only needs to know:
+- Its own port (for binding PUSH sockets)
+- Previous stage's address (for connecting PULL socket)
+- Last stage's address (Stage 0 for return path)
+
+**Option 2: Automated Test Script (Bind Mode)**
 
 ```bash
 # Using the test script
 bash tools/zeromq-pp-test.sh
 ```
 
-The script automatically:
+The script uses **External Pipeline Mode with Bind Mode architecture**:
+- **Bind Mode**: PUSH sockets bind to ports (senders), PULL sockets connect to addresses (receivers)
+- This allows Kubernetes Service load balancing and flexible receiver connections
 - Launches all pipeline stages as separate vLLM instances
-- Configures ZeroMQ communication between stages
+- Configures ZeroMQ communication between stages using bind mode
 - Maps each stage to a specific GPU
 - Sets up forward and return communication paths
 - Waits for initialization and runs a test inference
@@ -288,72 +223,82 @@ GPU_IDS=(0 1 2 3)                                           # GPU mapping (one p
 VLLM_SOURCE_DIR="/home/yanying/workspace/github/vllm"      # vLLM source directory
 ```
 
-**Manual Launch** (if you prefer to launch stages manually):
+**Manual Launch** (Bind Mode - matches `zeromq-pp-test.sh` behavior):
+
+In bind mode, PUSH sockets bind to ports (senders), and PULL sockets connect to addresses (receivers).
+
+**Key Principle**: Each stage only needs to know its own configuration and the addresses of stages it connects to.
 
 ```bash
 # Stage 0 (first stage with HTTP API)
+# Only needs: its own bind port, next stage address, last stage return address
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_0 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 0 \
     --pipeline-total-stages 4 \
+    --pipeline-local-bind-port 15550 \
     --pipeline-next-stage-addr 127.0.0.1:15550 \
-    --pipeline-local-listen-port 15554 \
+    --pipeline-prev-stage-addr 127.0.0.1:15554 \
+    --tensor-parallel-size 1 \
     --port 8000
 
 # Stage 1 (middle stage)
+# Only needs: its own bind port, previous stage address
 CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_1 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 1 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15551 \
-    --pipeline-local-listen-port 15550 \
+    --pipeline-local-bind-port 15551 \
+    --pipeline-next-stage-addr 127.0.0.1:15550 \
+    --tensor-parallel-size 1 \
     --external-pp-worker
 
 # Stage 2 (middle stage)
+# Only needs: its own bind port, previous stage address
 CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_2 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 2 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15552 \
-    --pipeline-local-listen-port 15551 \
+    --pipeline-local-bind-port 15552 \
+    --pipeline-next-stage-addr 127.0.0.1:15551 \
+    --tensor-parallel-size 1 \
     --external-pp-worker
 
 # Stage 3 (last stage)
+# Only needs: its own bind ports (forward and return), previous stage address
 CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_3 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 3 \
     --pipeline-total-stages 4 \
-    --pipeline-prev-stage-addr 127.0.0.1:15554 \
-    --pipeline-local-listen-port 15552 \
+    --pipeline-local-bind-port 15554 \
+    --pipeline-next-stage-addr 127.0.0.1:15552 \
+    --tensor-parallel-size 1 \
     --external-pp-worker
 ```
 
-**Port Configuration**:
-- Forward path: `BASE_PORT + stage_idx` (stage_i sends to stage_{i+1})
-- Return path: `BASE_PORT + NUM_STAGES` (last stage sends to stage 0)
-- Stage 0 listens on return port to receive final results
-- Non-first stages listen on forward ports to receive from previous stage
+**Port Configuration (Bind Mode)**:
+- **Forward path**: 
+  - Stage i (non-last) binds PUSH socket on port `BASE_PORT + i`
+  - Stage i+1 connects PULL socket to `IP:BASE_PORT+i` (only needs to know previous stage's address)
+- **Return path**:
+  - Last stage binds PUSH socket on port `BASE_PORT + NUM_STAGES`
+  - Stage 0 connects PULL socket to `IP:BASE_PORT+NUM_STAGES` (only needs to know last stage's address)
+- Example with BASE_PORT=15550, NUM_STAGES=4:
+  - Stage 0 binds PUSH on 15550, Stage 1 connects PULL to 127.0.0.1:15550
+  - Stage 1 binds PUSH on 15551, Stage 2 connects PULL to 127.0.0.1:15551
+  - Stage 2 binds PUSH on 15552, Stage 3 connects PULL to 127.0.0.1:15552
+  - Stage 3 binds PUSH on 15554 (return), Stage 0 connects PULL to 127.0.0.1:15554
+
+**Design Principle**: Each stage is independent and only needs minimal information:
+- **Stage 0**: Its own bind port, next stage address, last stage return address
+- **Middle stages**: Their own bind port, previous stage address
+- **Last stage**: Its own bind ports (forward and return), previous stage address
 
 ## Technical Details
-
-### ZeroMQPPGroup Implementation
-
-The `ZeroMQPPGroup` class in `test_pipeline_engine.py` provides a drop-in replacement for NCCL-based pipeline groups:
-
-```python
-class ZeroMQPPGroup:
-    def send_tensor_dict(self, tensor_dict, dst=None, ...):
-        """Forwards to ZeroMQCommunicator.send_tensor_dict()"""
-        
-    def recv_tensor_dict(self, src=None, ...):
-        """Forwards to ZeroMQCommunicator.recv_tensor_dict()"""
-```
-
-This allows vLLM's model executor to use ZeroMQ without any code changes - it simply calls `get_pp_group().send_tensor_dict()` as usual, but the underlying implementation uses ZeroMQ instead of NCCL.
 
 ### Tensor Transfer Process
 
@@ -372,17 +317,22 @@ This allows vLLM's model executor to use ZeroMQ without any code changes - it si
 
 ### Port Configuration
 
-#### Monkey Patching Approach (`test_pipeline.py`, `test_pipeline_engine.py`)
-- Default forward ports: `5555, 5556, 5557, ...` (one per stage boundary)
-- Default backward port: `15555` (for token ID feedback)
-- Can be customized via `--zmq-ports` argument
-
-#### External Pipeline Mode (`zeromq-pp-test.sh`)
-- Forward path ports: `BASE_PORT + stage_idx` (e.g., 15550, 15551, 15552 for 4 stages)
-- Return path port: `BASE_PORT + NUM_STAGES` (e.g., 15554 for 4 stages)
-- Configured in `tools/zeromq-pp-test.sh` via `BASE_PORT` variable
-- Stage 0 listens on return port to receive final results from last stage
-- Non-first stages listen on forward ports to receive from previous stage
+#### External Pipeline Mode with Bind Mode (`zeromq-pp-test.sh`, `http_index.py`, `test_pipeline.py`)
+- **Architecture**: Bind Mode - PUSH sockets bind to ports, PULL sockets connect to addresses
+- **Design Principle**: Each stage is independent and only needs minimal information about stages it connects to
+- **Forward path ports**: 
+  - Stage i (non-last) binds PUSH socket on `BASE_PORT + i` (e.g., 15550, 15551, 15552 for 4 stages)
+  - Stage i+1 connects PULL socket to previous stage's address (only needs to know previous stage's IP:port)
+- **Return path port**: 
+  - Last stage binds PUSH socket on `BASE_PORT + NUM_STAGES` (e.g., 15554 for 4 stages)
+  - Stage 0 connects PULL socket to last stage's address (only needs to know last stage's IP:port)
+- **Configuration**:
+  - Configured in `tools/zeromq-pp-test.sh` via `BASE_PORT` variable
+  - Configured in `http_index.py` via `--base-port` argument
+- **Parameters**:
+  - Uses `--pipeline-local-bind-port` for PUSH socket binding (each stage's own port)
+  - Uses `--pipeline-next-stage-addr` for connecting to previous stage (IP:port)
+  - Uses `--pipeline-prev-stage-addr` for Stage 0 to connect to last stage's return path (IP:port)
 
 ## Future Improvements
 
@@ -396,7 +346,7 @@ This allows vLLM's model executor to use ZeroMQ without any code changes - it si
 
 ## Related Commits
 
-- `cbfc1eb`: Initial ZeroMQ implementation (monkey patching approach)
+- `cbfc1eb`: Initial ZeroMQ implementation
 - `83e77c4cb`: Added external pipeline mode with core vLLM modifications
 - `cab0fe2c8`: Removed debug logs
 - `7f9dca2b6`, `e326ee0f9`: Additional updates
@@ -405,7 +355,7 @@ This allows vLLM's model executor to use ZeroMQ without any code changes - it si
 
 ### Files Modified in Core vLLM (commit `83e77c4cb`)
 
-These modifications are **only needed** for the "External Pipeline Mode" feature. The monkey patching approach (`test_pipeline_engine.py`) does **NOT** require these changes:
+These modifications are **required** for the "External Pipeline Mode" feature:
 
 1. `vllm/v1/worker/gpu_model_runner.py` - Added external pipeline mode support (~1000 lines)
 2. `vllm/distributed/device_communicators/zeromq_communicator.py` - New ZeroMQ communicator
@@ -418,22 +368,23 @@ These modifications are **only needed** for the "External Pipeline Mode" feature
 
 ### Files in Tools Directory
 
-#### Files in `tools/offline_pipelining/` (No Core Changes Required)
-
-All files in `tools/offline_pipelining/` work with **unmodified vLLM core** using monkey patching:
+#### Files in `tools/offline_pipelining/`
 
 1. `zmq_communicator.py` - ZeroMQ communication implementation
-2. `test_pipeline.py` - Simple pipeline test (no vLLM engine)
-3. `test_pipeline_engine.py` - Pipeline test with vLLM engine (uses monkey patching)
-4. `serve_pipeline.py` - Pipeline export tool
-5. `test_model_zeromq.py` - Model validation test
-6. `http_index.py` - HTTP entry point for ZeroMQ pipeline (launches stages and exposes HTTP API)
+2. `test_pipeline.py` - Simple pipeline test (uses ZeroMQCommunicator directly)
+3. `serve_pipeline.py` - Pipeline export tool
+4. `test_model_zeromq.py` - Model validation test
+5. `http_index.py` - HTTP entry point for ZeroMQ pipeline (launches stages using external pipeline mode and exposes HTTP API)
 
 #### Files in `tools/` (External Pipeline Mode)
 
 1. `zeromq-pp-test.sh` - Automated test script for external pipeline mode
+   - **Mode**: External Pipeline Mode with **Bind Mode** architecture
+   - **Architecture**: PUSH sockets bind to ports (senders), PULL sockets connect to addresses (receivers)
    - Launches multiple vLLM instances as pipeline stages
-   - Configures ZeroMQ communication automatically
+   - Configures ZeroMQ communication automatically using bind mode
+   - Uses `--pipeline-local-bind-port` for PUSH socket binding
+   - Uses `--pipeline-next-stage-addr` and `--pipeline-prev-stage-addr` for PULL socket connection
    - Handles GPU mapping and port configuration
    - Runs test inference and provides logging
    - **Requires**: External pipeline mode (core modifications from commit `83e77c4cb`)
@@ -444,8 +395,7 @@ All files in `tools/offline_pipelining/` work with **unmodified vLLM core** usin
 
 If you see "Address already in use" errors:
 - Check if ports are already in use: `netstat -tuln | grep <port>` or `ss -tuln | grep <port>`
-- For monkey patching approach: Use `--zmq-ports` to specify different ports
-- For external pipeline mode: Modify `BASE_PORT` in `tools/zeromq-pp-test.sh`
+- For external pipeline mode: Modify `BASE_PORT` in `tools/zeromq-pp-test.sh` or `--base-port` in `http_index.py`
 - Ensure previous pipeline processes are terminated: `pkill -f "vllm.*serve"` or check PIDs from script output
 
 ### Timeout Errors

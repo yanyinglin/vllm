@@ -157,14 +157,10 @@ class ZeroMQPPCommunicator:
         # - Last stage (sender) binds a PUSH socket on `local_bind_port` (return port)
         #   for the return path, allowing stage 0's PULL socket to connect.
         # - Stage 0 (receiver) connects a PULL socket to `prev_stage_addr` (last stage's return Service).
-        if self.is_last and prev_stage_addr is not None:
+        if self.is_last and not self.is_first:
             # Last stage binds PUSH socket for return path (bind mode)
-            # Note: prev_stage_addr is used to determine the bind port in bind mode
-            # Actually, we need a separate return_bind_port parameter
-            # For now, use local_bind_port if available, otherwise derive from prev_stage_addr
+            # Only needed if there are multiple stages (not first and last)
             if local_bind_port is None:
-                # Try to extract port from prev_stage_addr or use a default offset
-                # For simplicity, require local_bind_port to be set for return path
                 raise ValueError(
                     f"Stage {self.stage_idx}: local_bind_port must be provided for last stage "
                     "return path (bind mode) - this is the port for return PUSH socket to bind"
