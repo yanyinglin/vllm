@@ -86,11 +86,25 @@ class ParallelConfig:
     Only used in external mode. If specified, overrides automatic layer calculation.
     Embedding layer is fixed in the first stage (stage_idx=0)."""
     
-    pipeline_next_stage_addr: str | None = None
-    """Address of next stage Service in "ip:port" format for PULL socket to connect, only used in external mode (bind mode)"""
+    pipeline_prev_stage_service_addr: str | None = None
+    """Address of previous stage's PUSH Service in "ip:port" format for PULL socket to connect (bind mode).
+    In bind mode, Stage i+1 connects its PULL socket to Stage i's PUSH Service.
+    Only used in external mode for non-first stages."""
     
     pipeline_prev_stage_addr: str | None = None
     """Address of previous stage Service in "ip:port" format for return PULL socket to connect, only used in external mode (bind mode, optional)"""
+    
+    # Backward compatibility: keep old parameter name as alias
+    @property
+    def pipeline_next_stage_addr(self) -> str | None:
+        """Backward compatibility alias for pipeline_prev_stage_service_addr.
+        In bind mode, this actually refers to the PREVIOUS stage's address."""
+        return self.pipeline_prev_stage_service_addr
+    
+    @pipeline_next_stage_addr.setter
+    def pipeline_next_stage_addr(self, value: str | None):
+        """Backward compatibility setter."""
+        self.pipeline_prev_stage_service_addr = value
     
     pipeline_local_listen_port: int | None = None
     """Local port for PULL socket to bind (legacy) or connect address (bind mode), only used in external mode"""
@@ -404,41 +418,43 @@ class ParallelConfig:
                         f"pipeline_total_stages ({self.pipeline_total_stages})"
                     )
             
-            # Validate required addresses/ports for external PP communication
+            # Validate required addresses/ports for external PP communication (bind mode)
             is_first = self.pipeline_stage_idx == 0
             is_last = (
                 self.pipeline_total_stages is not None
                 and self.pipeline_stage_idx == self.pipeline_total_stages - 1
             )
             
-            # Non-first stages need a local listen port to receive from previous stage
-            if not is_first and self.pipeline_local_listen_port is None:
+            # Forward path validation (bind mode):
+            # - Non-last stages need local_bind_port to bind PUSH socket (for next stage to connect)
+            # - Non-first stages need prev_stage_service_addr to connect PULL socket to previous stage
+            if not is_last and self.pipeline_local_bind_port is None:
                 raise ValueError(
-                    f"pipeline_local_listen_port must be set for stage {self.pipeline_stage_idx} "
-                    "(non-first stages need to receive data from previous stage)"
+                    f"pipeline_local_bind_port must be set for stage {self.pipeline_stage_idx} "
+                    "(non-last stages need to bind PUSH socket in bind mode)"
                 )
             
-            # Non-last stages need next_stage_addr to send to next stage
-            if not is_last and self.pipeline_next_stage_addr is None:
+            if not is_first and self.pipeline_prev_stage_service_addr is None:
                 raise ValueError(
-                    f"pipeline_next_stage_addr must be set for stage {self.pipeline_stage_idx} "
-                    "(non-last stages need to send data to next stage)"
+                    f"pipeline_prev_stage_service_addr must be set for stage {self.pipeline_stage_idx} "
+                    "(non-first stages need to connect PULL socket to previous stage's PUSH Service in bind mode)"
                 )
             
-            # Last stage needs prev_stage_addr for return path to stage 0
-            if is_last and self.pipeline_prev_stage_addr is None:
-                raise ValueError(
-                    f"pipeline_prev_stage_addr must be set for stage {self.pipeline_stage_idx} "
-                    "(last stage needs return path address to send results back to stage 0)"
-                )
+            # Return path validation (bind mode, optional):
+            # - Last stage needs local_bind_port for return PUSH socket (if return path enabled via prev_stage_addr)
+            # - Stage 0 needs prev_stage_addr to connect return PULL socket (if return path enabled)
+            # Both sides must agree on return path configuration (symmetry check via prev_stage_addr)
+            if is_last and not is_first and self.pipeline_prev_stage_addr is not None:
+                # Last stage: return path is enabled, need local_bind_port for return PUSH socket
+                if self.pipeline_local_bind_port is None:
+                    raise ValueError(
+                        f"pipeline_local_bind_port must be set for last stage {self.pipeline_stage_idx} "
+                        "when return path is enabled (prev_stage_addr is set) - "
+                        "this is the port for return PUSH socket to bind"
+                    )
             
-            # Stage 0 needs a return listen port if there are multiple stages
-            # (to receive final results from the last stage)
-            if is_first and not is_last and self.pipeline_local_listen_port is None:
-                raise ValueError(
-                    f"pipeline_local_listen_port must be set for stage 0 when "
-                    f"pipeline_total_stages > 1 (to receive return results from last stage)"
-                )
+            # Stage 0 return path: if prev_stage_addr is set, it will connect return PULL socket
+            # No additional validation needed - prev_stage_addr being set is sufficient indication
             
             # In external mode, pipeline_parallel_size should be 1 for world_size calculation
             # but we keep the original value for compatibility

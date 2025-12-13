@@ -162,7 +162,7 @@ for stage_idx in $(seq 0 $((NUM_STAGES - 1))); do
     if [ "$IS_FIRST" = "false" ]; then
         # Non-first stages: connect PULL socket to previous stage's PUSH Service
         PREV_BIND_PORT=$((BASE_PORT + stage_idx - 1))
-        CMD="$CMD --pipeline-next-stage-addr ${LOCAL_IP}:${PREV_BIND_PORT}"
+        CMD="$CMD --pipeline-prev-stage-service-addr ${LOCAL_IP}:${PREV_BIND_PORT}"
     fi
     
     # Return path: last stage binds PUSH, stage 0 connects PULL

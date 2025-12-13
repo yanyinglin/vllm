@@ -35,7 +35,8 @@ class ZeroMQPPCommunicator:
         stage_idx: int,
         num_stages: int,
         local_listen_port: int | None = None,
-        next_stage_addr: str | None = None,  # "ip:port" format for PULL to connect (bind mode)
+        prev_stage_service_addr: str | None = None,  # "ip:port" format for PULL to connect to previous stage's PUSH (bind mode)
+        next_stage_addr: str | None = None,  # Backward compatibility alias
         prev_stage_addr: str | None = None,  # "ip:port" format for return PULL to connect (bind mode)
         local_bind_port: int | None = None,  # Port for PUSH socket to bind (bind mode)
         device: str = "cuda",
@@ -47,7 +48,8 @@ class ZeroMQPPCommunicator:
             stage_idx: Current stage index (0-based)
             num_stages: Total number of stages
             local_listen_port: Local port for PULL socket (legacy) or connect address (bind mode)
-            next_stage_addr: Address of next stage Service in "ip:port" format for PULL socket to connect (bind mode)
+            prev_stage_service_addr: Address of previous stage's PUSH Service in "ip:port" format for PULL socket to connect (bind mode)
+            next_stage_addr: [DEPRECATED] Backward compatibility alias for prev_stage_service_addr
             prev_stage_addr: Address of previous stage Service in "ip:port" format for return PULL socket to connect (bind mode, optional)
             local_bind_port: Local port to bind for PUSH socket (bind mode), allowing multiple receivers via Service
             device: Target device (e.g., "cuda", "cpu")
@@ -72,12 +74,14 @@ class ZeroMQPPCommunicator:
         self.return_push_socket: zmq.Socket | None = None
         self.return_pull_socket: zmq.Socket | None = None
 
-        self._setup_sockets(local_listen_port, next_stage_addr, prev_stage_addr, local_bind_port)
+        # Use new parameter name, fallback to old name for backward compatibility
+        actual_prev_stage_service_addr = prev_stage_service_addr or next_stage_addr
+        self._setup_sockets(local_listen_port, actual_prev_stage_service_addr, prev_stage_addr, local_bind_port)
     
     def _setup_sockets(
         self,
         local_listen_port: int | None,
-        next_stage_addr: str | None,
+        prev_stage_service_addr: str | None,
         prev_stage_addr: str | None,
         local_bind_port: int | None,
     ) -> None:
@@ -90,20 +94,20 @@ class ZeroMQPPCommunicator:
         # Forward direction: receive from previous stage (stage_{k-1} -> stage_k)
         # In bind mode: PULL socket connects to previous stage's PUSH Service
         if not self.is_first:
-            if next_stage_addr is None:
+            if prev_stage_service_addr is None:
                 raise ValueError(
-                    f"Stage {self.stage_idx}: next_stage_addr must be provided for non-first stages "
-                    "(this is the address of previous stage's PUSH Service to connect to)"
+                    f"Stage {self.stage_idx}: prev_stage_service_addr must be provided for non-first stages "
+                    "(this is the address of previous stage's PUSH Service to connect to in bind mode)"
                 )
             
             self.pull_socket = self.context.socket(zmq.PULL)
             # Set LINGER to ensure messages are not lost on close
             self.pull_socket.setsockopt(zmq.LINGER, 1000)
             # Connect to previous stage's PUSH Service (bind mode)
-            self.pull_socket.connect(f"tcp://{next_stage_addr}")
+            self.pull_socket.connect(f"tcp://{prev_stage_service_addr}")
             self.pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
             logger.info(
-                f"Stage {self.stage_idx} connecting PULL socket to previous stage Service {next_stage_addr}"
+                f"Stage {self.stage_idx} connecting PULL socket to previous stage's PUSH Service {prev_stage_service_addr}"
             )
             # Wait for connection to establish
             max_wait_time = 10.0
@@ -118,14 +122,14 @@ class ZeroMQPPCommunicator:
                 if self.pull_socket in events:
                     connection_ready = True
                     logger.info(
-                        f"Stage {self.stage_idx} PULL socket connection established to {next_stage_addr}"
+                        f"Stage {self.stage_idx} PULL socket connection established to previous stage's PUSH Service"
                     )
                     break
                 time.sleep(0.2)
             
             if not connection_ready:
                 logger.warning(
-                    f"Stage {self.stage_idx} PULL socket connection to {next_stage_addr} "
+                    f"Stage {self.stage_idx} PULL socket connection to previous stage's PUSH Service "
                     f"may not be ready after {max_wait_time}s. "
                     "This is OK if the previous stage hasn't started yet - ZeroMQ will queue messages."
                 )
@@ -157,9 +161,10 @@ class ZeroMQPPCommunicator:
         # - Last stage (sender) binds a PUSH socket on `local_bind_port` (return port)
         #   for the return path, allowing stage 0's PULL socket to connect.
         # - Stage 0 (receiver) connects a PULL socket to `prev_stage_addr` (last stage's return Service).
-        if self.is_last and not self.is_first:
+        # Both sides only set up return path if prev_stage_addr is provided (symmetry check).
+        if self.is_last and not self.is_first and prev_stage_addr is not None:
             # Last stage binds PUSH socket for return path (bind mode)
-            # Only needed if there are multiple stages (not first and last)
+            # Only needed if there are multiple stages (not first and last) and return path is enabled
             if local_bind_port is None:
                 raise ValueError(
                     f"Stage {self.stage_idx}: local_bind_port must be provided for last stage "

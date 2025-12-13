@@ -65,7 +65,8 @@ Starting from commit `cbfc1eb`, we migrated pipeline parallelism data transmissi
      - `pipeline_stage_idx`: Current stage index
      - `pipeline_total_stages`: Total number of stages
      - `pipeline_layer_range`: Layer range for current stage
-     - `pipeline_next_stage_addr`: Next stage address (IP:port)
+     - `pipeline_prev_stage_service_addr`: Previous stage's PUSH Service address (IP:port) for PULL socket to connect (bind mode)
+     - `pipeline_next_stage_addr`: [DEPRECATED] Backward compatibility alias for `pipeline_prev_stage_service_addr`
      - `pipeline_prev_stage_addr`: Previous stage address
      - `pipeline_local_listen_port`: Local listen port
      - `pipeline_local_bind_port`: Local bind port for PUSH sockets (bind mode)
@@ -225,78 +226,108 @@ VLLM_SOURCE_DIR="/home/yanying/workspace/github/vllm"      # vLLM source directo
 
 **Manual Launch** (Bind Mode - matches `zeromq-pp-test.sh` behavior):
 
-In bind mode, PUSH sockets bind to ports (senders), and PULL sockets connect to addresses (receivers).
+**Bind Mode Architecture**:
+- PUSH sockets bind to ports (senders bind, receivers connect)
+- PULL sockets connect to Service addresses (receivers connect to senders)
+- This allows Kubernetes Service load balancing
 
-**Key Principle**: Each stage only needs to know its own configuration and the addresses of stages it connects to.
+**Communication Flow**:
+- Forward path: Stage i binds PUSH socket, Stage i+1 connects PULL socket to Stage i
+- Return path: Last stage binds PUSH socket, Stage 0 connects PULL socket to last stage
+
+**Parameter Names**:
+- `--pipeline-prev-stage-service-addr`: Address of previous stage's PUSH Service (recommended, clear name)
+  - Stage i+1 uses this to connect its PULL socket to Stage i's PUSH Service
+  - In bind mode: Stage i binds PUSH, Stage i+1 connects PULL to it
+- `--pipeline-next-stage-addr`: [DEPRECATED] Backward compatibility alias for `--pipeline-prev-stage-service-addr`
+  - Despite the name, in bind mode this actually refers to the PREVIOUS stage's address
+  - Kept for backward compatibility but the new name is recommended
+
+**Key Principle**: Each stage only needs to know:
+- Its own port (for binding PUSH socket if not last stage)
+- Previous stage's address (for connecting PULL socket if not first stage)
+- Last stage's address (Stage 0 for return path, if needed)
 
 ```bash
 # Stage 0 (first stage with HTTP API)
-# Only needs: its own bind port, next stage address, last stage return address
+# - Binds PUSH socket on port 15550 (Stage 1 will connect PULL to this)
+# - Connects PULL socket to last stage's return port 15554 (if return path enabled)
 CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_0 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 0 \
     --pipeline-total-stages 4 \
     --pipeline-local-bind-port 15550 \
-    --pipeline-next-stage-addr 127.0.0.1:15550 \
     --pipeline-prev-stage-addr 127.0.0.1:15554 \
     --tensor-parallel-size 1 \
     --port 8000
 
 # Stage 1 (middle stage)
-# Only needs: its own bind port, previous stage address
+# - Connects PULL socket to Stage 0's PUSH Service (127.0.0.1:15550)
+# - Binds PUSH socket on port 15550 (Stage 2 will connect PULL to this)
 CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_1 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 1 \
     --pipeline-total-stages 4 \
-    --pipeline-local-bind-port 15551 \
-    --pipeline-next-stage-addr 127.0.0.1:15550 \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 
 # Stage 2 (middle stage)
-# Only needs: its own bind port, previous stage address
+# - Connects PULL socket to Stage 1's PUSH Service (127.0.0.1:15550)
+# - Binds PUSH socket on port 15550 (Stage 3 will connect PULL to this)
 CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_2 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 2 \
     --pipeline-total-stages 4 \
-    --pipeline-local-bind-port 15552 \
-    --pipeline-next-stage-addr 127.0.0.1:15551 \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 
 # Stage 3 (last stage)
-# Only needs: its own bind ports (forward and return), previous stage address
+# - Connects PULL socket to Stage 2's PUSH Service (127.0.0.1:15550)
+# - Binds PUSH socket on port 15554 for return path (Stage 0 will connect PULL to this)
 CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve \
     /path/to/pipeline/stage_3 \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 3 \
     --pipeline-total-stages 4 \
     --pipeline-local-bind-port 15554 \
-    --pipeline-next-stage-addr 127.0.0.1:15552 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 ```
 
 **Port Configuration (Bind Mode)**:
 - **Forward path**: 
-  - Stage i (non-last) binds PUSH socket on port `BASE_PORT + i`
-  - Stage i+1 connects PULL socket to `IP:BASE_PORT+i` (only needs to know previous stage's address)
+  - Stage i (non-last) binds PUSH socket on port `BASE_PORT`
+  - Stage i+1 connects PULL socket to `Stage_i_IP:BASE_PORT` (needs to know previous stage's address)
+  - Note: All stages use the same `BASE_PORT` for forward path in the current implementation
 - **Return path**:
   - Last stage binds PUSH socket on port `BASE_PORT + NUM_STAGES`
-  - Stage 0 connects PULL socket to `IP:BASE_PORT+NUM_STAGES` (only needs to know last stage's address)
+  - Stage 0 connects PULL socket to `Last_Stage_IP:BASE_PORT+NUM_STAGES` (needs to know last stage's address)
 - Example with BASE_PORT=15550, NUM_STAGES=4:
   - Stage 0 binds PUSH on 15550, Stage 1 connects PULL to 127.0.0.1:15550
-  - Stage 1 binds PUSH on 15551, Stage 2 connects PULL to 127.0.0.1:15551
-  - Stage 2 binds PUSH on 15552, Stage 3 connects PULL to 127.0.0.1:15552
+  - Stage 1 binds PUSH on 15550, Stage 2 connects PULL to 127.0.0.1:15550
+  - Stage 2 binds PUSH on 15550, Stage 3 connects PULL to 127.0.0.1:15550
   - Stage 3 binds PUSH on 15554 (return), Stage 0 connects PULL to 127.0.0.1:15554
 
+**Parameter Names**:
+- `--pipeline-prev-stage-service-addr`: Address of previous stage's PUSH Service (recommended, clear name)
+  - Used by Stage i+1 to connect its PULL socket to Stage i's PUSH Service
+  - In bind mode: Stage i binds PUSH, Stage i+1 connects PULL to it
+- `--pipeline-next-stage-addr`: [DEPRECATED] Backward compatibility alias
+  - Despite the name, in bind mode this refers to the PREVIOUS stage's address
+  - Kept for backward compatibility but the new name is recommended
+
 **Design Principle**: Each stage is independent and only needs minimal information:
-- **Stage 0**: Its own bind port, next stage address, last stage return address
-- **Middle stages**: Their own bind port, previous stage address
-- **Last stage**: Its own bind ports (forward and return), previous stage address
+- **Stage 0**: Its own bind port (for PUSH), last stage return address (for return PULL)
+- **Middle stages**: Their own bind port (for PUSH), previous stage address (for PULL)
+- **Last stage**: Its own bind ports (forward PUSH and return PUSH), previous stage address (for PULL)
 
 ## Technical Details
 
@@ -321,17 +352,20 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve \
 - **Architecture**: Bind Mode - PUSH sockets bind to ports, PULL sockets connect to addresses
 - **Design Principle**: Each stage is independent and only needs minimal information about stages it connects to
 - **Forward path ports**: 
-  - Stage i (non-last) binds PUSH socket on `BASE_PORT + i` (e.g., 15550, 15551, 15552 for 4 stages)
-  - Stage i+1 connects PULL socket to previous stage's address (only needs to know previous stage's IP:port)
+  - Stage i (non-last) binds PUSH socket on `BASE_PORT` (all stages use same port in current implementation)
+  - Stage i+1 connects PULL socket to previous stage's address (needs to know previous stage's IP:port)
 - **Return path port**: 
   - Last stage binds PUSH socket on `BASE_PORT + NUM_STAGES` (e.g., 15554 for 4 stages)
-  - Stage 0 connects PULL socket to last stage's address (only needs to know last stage's IP:port)
+  - Stage 0 connects PULL socket to last stage's address (needs to know last stage's IP:port)
 - **Configuration**:
   - Configured in `tools/zeromq-pp-test.sh` via `BASE_PORT` variable
   - Configured in `http_index.py` via `--base-port` argument
 - **Parameters**:
   - Uses `--pipeline-local-bind-port` for PUSH socket binding (each stage's own port)
-  - Uses `--pipeline-next-stage-addr` for connecting to previous stage (IP:port)
+  - Uses `--pipeline-prev-stage-service-addr` for connecting to previous stage's PUSH Service (IP:port, recommended)
+    - Stage i+1 uses this to connect its PULL socket to Stage i's PUSH Service
+    - In bind mode: Stage i binds PUSH, Stage i+1 connects PULL to it
+  - Uses `--pipeline-next-stage-addr` as backward compatibility alias (deprecated, use `--pipeline-prev-stage-service-addr` instead)
   - Uses `--pipeline-prev-stage-addr` for Stage 0 to connect to last stage's return path (IP:port)
 
 ## Future Improvements
@@ -384,7 +418,9 @@ These modifications are **required** for the "External Pipeline Mode" feature:
    - Launches multiple vLLM instances as pipeline stages
    - Configures ZeroMQ communication automatically using bind mode
    - Uses `--pipeline-local-bind-port` for PUSH socket binding
-   - Uses `--pipeline-next-stage-addr` and `--pipeline-prev-stage-addr` for PULL socket connection
+   - Uses `--pipeline-prev-stage-service-addr` for connecting to previous stage's PUSH Service (recommended)
+  - Uses `--pipeline-next-stage-addr` as backward compatibility alias (deprecated)
+  - Uses `--pipeline-prev-stage-addr` for Stage 0 to connect to last stage's return path
    - Handles GPU mapping and port configuration
    - Runs test inference and provides logging
    - **Requires**: External pipeline mode (core modifications from commit `83e77c4cb`)

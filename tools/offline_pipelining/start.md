@@ -23,8 +23,8 @@ The first stage exposes the HTTP API and receives final results from the last st
 --pipeline-stage-mode external
 --pipeline-stage-idx 0
 --pipeline-total-stages <total>
---pipeline-next-stage-addr <IP>:<PORT>      # Address of next stage (sends data forward)
---pipeline-local-listen-port <PORT>        # Port to listen for return path (receives final results from last stage)
+--pipeline-local-bind-port <PORT>           # Port to bind PUSH socket (for Stage 1 to connect PULL)
+--pipeline-prev-stage-addr <IP>:<PORT>     # Address of last stage's return PUSH Service (for return path PULL socket to connect)
 --port <API_PORT>                          # HTTP API port (only stage 0 needs this)
 ```
 
@@ -36,8 +36,8 @@ python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 0 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15550 \
-    --pipeline-local-listen-port 15554 \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-addr 127.0.0.1:15554 \
     --tensor-parallel-size 1 \
     --port 8000
 ```
@@ -52,8 +52,8 @@ Middle stages receive data from the previous stage and forward to the next stage
 --pipeline-stage-mode external
 --pipeline-stage-idx <index>
 --pipeline-total-stages <total>
---pipeline-next-stage-addr <IP>:<PORT>      # Address of next stage
---pipeline-local-listen-port <PORT>        # Port to listen for previous stage (receives data)
+--pipeline-prev-stage-service-addr <IP>:<PORT>  # Address of previous stage's PUSH Service (for PULL socket to connect in bind mode)
+--pipeline-local-bind-port <PORT>          # Port to bind PUSH socket (for next stage to connect PULL)
 --external-pp-worker                        # Mark as external PP worker (no HTTP API)
 ```
 
@@ -81,9 +81,9 @@ The last stage receives data from the previous stage and sends final results bac
 --pipeline-stage-mode external
 --pipeline-stage-idx <last-index>
 --pipeline-total-stages <total>
---pipeline-prev-stage-addr <IP>:<PORT>      # Return path address to stage 0 (sends final results)
---pipeline-local-listen-port <PORT>        # Port to listen for previous stage (receives data)
---external-pp-worker                        # Mark as external PP worker
+--pipeline-prev-stage-service-addr <IP>:<PORT>  # Address of previous stage's PUSH Service (for PULL socket to connect)
+--pipeline-local-bind-port <RETURN_PORT>       # Port to bind return PUSH socket (for Stage 0 to connect return PULL)
+--external-pp-worker                            # Mark as external PP worker
 ```
 
 ### Example
@@ -94,8 +94,8 @@ python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 3 \
     --pipeline-total-stages 4 \
-    --pipeline-prev-stage-addr 127.0.0.1:15554 \
-    --pipeline-local-listen-port 15552 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --pipeline-local-bind-port 15554 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 ```
@@ -110,8 +110,8 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 0 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15550 \
-    --pipeline-local-listen-port 15554 \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-addr 127.0.0.1:15554 \
     --tensor-parallel-size 1 \
     --port 8000
 ```
@@ -124,8 +124,8 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 1 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15551 \
-    --pipeline-local-listen-port 15550 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --pipeline-local-bind-port 15550 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 ```
@@ -138,8 +138,8 @@ CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 2 \
     --pipeline-total-stages 4 \
-    --pipeline-next-stage-addr 127.0.0.1:15552 \
-    --pipeline-local-listen-port 15551 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --pipeline-local-bind-port 15550 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 ```
@@ -152,36 +152,37 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve \
     --pipeline-stage-mode external \
     --pipeline-stage-idx 3 \
     --pipeline-total-stages 4 \
-    --pipeline-prev-stage-addr 127.0.0.1:15554 \
-    --pipeline-local-listen-port 15552 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --pipeline-local-bind-port 15554 \
     --tensor-parallel-size 1 \
     --external-pp-worker
 ```
 
-## Port Configuration Rules
+## Port Configuration Rules (Bind Mode)
 
 ### Forward Path (Stage i → Stage i+1)
 
-- Port formula: `BASE_PORT + stage_idx`
+- All stages bind PUSH socket on the same port: `BASE_PORT`
+- Stage i+1 connects PULL socket to Stage i's address: `Stage_i_IP:BASE_PORT`
 - Example with BASE_PORT=15550:
-  - Stage 0 → Stage 1: `15550` (BASE_PORT + 0)
-  - Stage 1 → Stage 2: `15551` (BASE_PORT + 1)
-  - Stage 2 → Stage 3: `15552` (BASE_PORT + 2)
+  - Stage 0 binds PUSH on 15550, Stage 1 connects PULL to 127.0.0.1:15550
+  - Stage 1 binds PUSH on 15550, Stage 2 connects PULL to 127.0.0.1:15550
+  - Stage 2 binds PUSH on 15550, Stage 3 connects PULL to 127.0.0.1:15550
 
 ### Return Path (Last Stage → Stage 0)
 
 - Port formula: `BASE_PORT + NUM_STAGES`
 - Example with BASE_PORT=15550, NUM_STAGES=4:
-  - Stage 3 → Stage 0: `15554` (BASE_PORT + 4)
+  - Stage 3 binds return PUSH on 15554, Stage 0 connects return PULL to 127.0.0.1:15554
 
 ### Port Assignment Summary
 
-| Stage | Forward Listen Port | Next Stage Address | Return Listen Port | Return Address |
-|-------|---------------------|-------------------|-------------------|----------------|
-| 0     | -                   | 127.0.0.1:15550  | 15554             | -              |
-| 1     | 15550               | 127.0.0.1:15551  | -                 | -              |
-| 2     | 15551               | 127.0.0.1:15552  | -                 | -              |
-| 3     | 15552               | -                 | -                 | 127.0.0.1:15554 |
+| Stage | Forward Bind Port (PUSH) | Previous Stage Address (PULL connects) | Return Bind Port (PUSH) | Return Address (PULL connects) |
+|-------|---------------------------|----------------------------------------|-------------------------|-------------------------------|
+| 0     | 15550                     | -                                      | -                       | 127.0.0.1:15554               |
+| 1     | 15550                     | 127.0.0.1:15550                        | -                       | -                              |
+| 2     | 15550                     | 127.0.0.1:15550                        | -                       | -                              |
+| 3     | -                         | 127.0.0.1:15550                        | 15554                   | -                              |
 
 ## Optional Parameters
 
@@ -228,8 +229,8 @@ vllm serve [args...]
 - [ ] `--pipeline-stage-mode external`
 - [ ] `--pipeline-stage-idx 0`
 - [ ] `--pipeline-total-stages <N>`
-- [ ] `--pipeline-next-stage-addr <IP>:<PORT>`
-- [ ] `--pipeline-local-listen-port <RETURN_PORT>`
+- [ ] `--pipeline-local-bind-port <PORT>` (for forward PUSH)
+- [ ] `--pipeline-prev-stage-addr <IP>:<PORT>` (for return PULL, if return path enabled)
 - [ ] `--port <API_PORT>`
 - [ ] `--tensor-parallel-size 1`
 
@@ -237,8 +238,8 @@ vllm serve [args...]
 - [ ] `--pipeline-stage-mode external`
 - [ ] `--pipeline-stage-idx <i>`
 - [ ] `--pipeline-total-stages <N>`
-- [ ] `--pipeline-next-stage-addr <IP>:<PORT>`
-- [ ] `--pipeline-local-listen-port <FORWARD_PORT>`
+- [ ] `--pipeline-prev-stage-service-addr <IP>:<PORT>` (previous stage's PUSH Service)
+- [ ] `--pipeline-local-bind-port <PORT>` (for forward PUSH)
 - [ ] `--external-pp-worker`
 - [ ] `--tensor-parallel-size 1`
 
@@ -246,8 +247,8 @@ vllm serve [args...]
 - [ ] `--pipeline-stage-mode external`
 - [ ] `--pipeline-stage-idx <N-1>`
 - [ ] `--pipeline-total-stages <N>`
-- [ ] `--pipeline-prev-stage-addr <IP>:<RETURN_PORT>`
-- [ ] `--pipeline-local-listen-port <FORWARD_PORT>`
+- [ ] `--pipeline-prev-stage-service-addr <IP>:<PORT>` (previous stage's PUSH Service)
+- [ ] `--pipeline-local-bind-port <RETURN_PORT>` (for return PUSH, if return path enabled)
 - [ ] `--external-pp-worker`
 - [ ] `--tensor-parallel-size 1`
 

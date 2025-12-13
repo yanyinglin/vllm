@@ -1084,7 +1084,8 @@ def init_external_pp_group(
     num_stages: int,
     local_rank: int,
     local_listen_port: int | None = None,
-    next_stage_addr: str | None = None,
+    prev_stage_service_addr: str | None = None,
+    next_stage_addr: str | None = None,  # Backward compatibility
     prev_stage_addr: str | None = None,
     local_bind_port: int | None = None,
     device: str = "cuda",
@@ -1100,7 +1101,8 @@ def init_external_pp_group(
         num_stages: Total number of stages
         local_rank: Local rank for device assignment
         local_listen_port: Local port to bind for receiving data
-        next_stage_addr: Address of next stage in "ip:port" format
+        prev_stage_service_addr: Address of previous stage's PUSH Service in "ip:port" format (bind mode)
+        next_stage_addr: [DEPRECATED] Backward compatibility alias for prev_stage_service_addr
         prev_stage_addr: Address of previous stage in "ip:port" format
         device: Target device (e.g., "cuda", "cpu")
     
@@ -1191,7 +1193,8 @@ def init_external_pp_group(
         stage_idx=stage_idx,
         num_stages=num_stages,
         local_listen_port=local_listen_port,
-        next_stage_addr=next_stage_addr,
+        prev_stage_service_addr=prev_stage_service_addr or next_stage_addr,
+        next_stage_addr=next_stage_addr,  # For backward compatibility
         prev_stage_addr=prev_stage_addr,
         local_bind_port=local_bind_port,
         device=device,
@@ -1564,7 +1567,8 @@ def initialize_model_parallel(
             num_stages=num_stages,
             local_rank=get_world_group().local_rank,
             local_listen_port=parallel_config.pipeline_local_listen_port,
-            next_stage_addr=parallel_config.pipeline_next_stage_addr,
+            prev_stage_service_addr=parallel_config.pipeline_prev_stage_service_addr or parallel_config.pipeline_next_stage_addr,
+            next_stage_addr=parallel_config.pipeline_next_stage_addr,  # For backward compatibility
             prev_stage_addr=parallel_config.pipeline_prev_stage_addr,
             local_bind_port=parallel_config.pipeline_local_bind_port,
             device=device,

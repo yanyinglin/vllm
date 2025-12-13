@@ -388,7 +388,9 @@ class EngineArgs:
     pipeline_stage_idx: int | None = ParallelConfig.pipeline_stage_idx
     pipeline_total_stages: int | None = ParallelConfig.pipeline_total_stages
     pipeline_layer_range: str | None = ParallelConfig.pipeline_layer_range
-    pipeline_next_stage_addr: str | None = ParallelConfig.pipeline_next_stage_addr
+    pipeline_prev_stage_service_addr: str | None = ParallelConfig.pipeline_prev_stage_service_addr
+    # Backward compatibility: use None as default since pipeline_next_stage_addr is now a property
+    pipeline_next_stage_addr: str | None = None
     pipeline_prev_stage_addr: str | None = ParallelConfig.pipeline_prev_stage_addr
     pipeline_local_listen_port: int | None = ParallelConfig.pipeline_local_listen_port
     pipeline_local_bind_port: int | None = ParallelConfig.pipeline_local_bind_port
@@ -787,10 +789,18 @@ class EngineArgs:
             help="Layer range for current stage in format 'start-end' or '[start-end]', e.g., '0-8'",
         )
         parallel_group.add_argument(
+            "--pipeline-prev-stage-service-addr",
+            type=str,
+            default=None,
+            help="Address of previous stage's PUSH Service in 'ip:port' format for external mode (bind mode). "
+                 "In bind mode, Stage i+1 uses this to connect its PULL socket to Stage i's PUSH Service.",
+        )
+        parallel_group.add_argument(
             "--pipeline-next-stage-addr",
             type=str,
             default=None,
-            help="Address of next stage in 'ip:port' format for external mode",
+            help="[DEPRECATED] Use --pipeline-prev-stage-service-addr instead. "
+                 "In bind mode, this actually refers to the PREVIOUS stage's address (kept for backward compatibility).",
         )
         parallel_group.add_argument(
             "--pipeline-prev-stage-addr",
@@ -1696,7 +1706,7 @@ class EngineArgs:
             pipeline_stage_idx=self.pipeline_stage_idx,
             pipeline_total_stages=self.pipeline_total_stages,
             pipeline_layer_range=self.pipeline_layer_range,
-            pipeline_next_stage_addr=self.pipeline_next_stage_addr,
+            pipeline_prev_stage_service_addr=self.pipeline_prev_stage_service_addr or self.pipeline_next_stage_addr,
             pipeline_prev_stage_addr=self.pipeline_prev_stage_addr,
             pipeline_local_listen_port=self.pipeline_local_listen_port,
             pipeline_local_bind_port=self.pipeline_local_bind_port,
