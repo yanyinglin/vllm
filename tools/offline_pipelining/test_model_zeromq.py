@@ -3,7 +3,12 @@
 vLLM pipeline stage tester.
 
 Discovers exported `stage_*` folders, validates their coverage, and invokes
-the vLLM inference engine end-to-end (no ZeroMQ) to check generation quality.
+the vLLM inference engine end-to-end using standard vLLM pipeline parallelism
+(NCCL-based, not ZeroMQ) to check generation quality.
+
+Note: This test uses vLLM's built-in pipeline_parallel_size, which uses NCCL
+for communication. For ZeroMQ-based pipeline testing, use test_pipeline.py
+or test_pipeline_engine.py instead.
 """
 
 from __future__ import annotations

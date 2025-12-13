@@ -87,13 +87,16 @@ class ParallelConfig:
     Embedding layer is fixed in the first stage (stage_idx=0)."""
     
     pipeline_next_stage_addr: str | None = None
-    """Address of next stage in "ip:port" format, only used in external mode"""
+    """Address of next stage Service in "ip:port" format for PULL socket to connect, only used in external mode (bind mode)"""
     
     pipeline_prev_stage_addr: str | None = None
-    """Address of previous stage in "ip:port" format, only used in external mode (optional)"""
+    """Address of previous stage Service in "ip:port" format for return PULL socket to connect, only used in external mode (bind mode, optional)"""
     
     pipeline_local_listen_port: int | None = None
-    """Local port to bind for receiving data from previous stage, only used in external mode"""
+    """Local port for PULL socket to bind (legacy) or connect address (bind mode), only used in external mode"""
+    
+    pipeline_local_bind_port: int | None = None
+    """Local port to bind for PUSH socket (bind mode), allowing multiple receivers to connect via Service, only used in external mode"""
     
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""

@@ -20,7 +20,7 @@ GPU_IDS=(0 1 2 3)
 export VLLM_SOURCE_DIR="/home/yanying/workspace/github/vllm"
 # If not set, will use installed vllm command
 VLLM_SOURCE_DIR="${VLLM_SOURCE_DIR:-}"
-
+vllm --
 # Get local IP address
 get_local_ip() {
     # Try to get IP from environment variable first
@@ -147,30 +147,35 @@ for stage_idx in $(seq 0 $((NUM_STAGES - 1))); do
     CMD="$CMD --pipeline-stage-idx $stage_idx"
     CMD="$CMD --pipeline-total-stages $NUM_STAGES"
     
-    # Set next stage address (except for last stage)
+    # Bind mode configuration:
+    # - PUSH sockets bind to ports (senders)
+    # - PULL sockets connect to Service addresses (receivers)
+    # - This allows Kubernetes Service load balancing
+    
+    # Forward path: stage_i binds PUSH, stage_{i+1} connects PULL
     if [ "$IS_LAST" = "false" ]; then
-        NEXT_PORT=$((BASE_PORT + stage_idx))
-        CMD="$CMD --pipeline-next-stage-addr ${LOCAL_IP}:${NEXT_PORT}"
+        # Non-last stages: bind PUSH socket to local port
+        BIND_PORT=$((BASE_PORT + stage_idx))
+        CMD="$CMD --pipeline-local-bind-port $BIND_PORT"
     fi
     
-    # Set local listen port for forward path (non-first stages receive from previous stage)
-    # Stage 0 needs a return listen port to receive final results from last stage
-    # Note: stage_0 uses return port, stage_1-3 use forward listen ports
     if [ "$IS_FIRST" = "false" ]; then
-        # Non-first stages: listen on forward path port to receive from previous stage
-        LISTEN_PORT=$((BASE_PORT + stage_idx - 1))
-        CMD="$CMD --pipeline-local-listen-port $LISTEN_PORT"
-    elif [ "$IS_FIRST" = "true" ] && [ "$IS_LAST" = "false" ]; then
-        # Stage 0: listen on return port to receive final results from last stage
-        RETURN_PORT=$((BASE_PORT + NUM_STAGES))
-        CMD="$CMD --pipeline-local-listen-port $RETURN_PORT"
+        # Non-first stages: connect PULL socket to previous stage's PUSH Service
+        PREV_BIND_PORT=$((BASE_PORT + stage_idx - 1))
+        CMD="$CMD --pipeline-next-stage-addr ${LOCAL_IP}:${PREV_BIND_PORT}"
     fi
     
-    # Last stage needs prev_stage_addr for return path to stage 0
+    # Return path: last stage binds PUSH, stage 0 connects PULL
     if [ "$IS_LAST" = "true" ]; then
-        # Return port is where stage 0 listens for return results
-        RETURN_PORT=$((BASE_PORT + NUM_STAGES))
-        CMD="$CMD --pipeline-prev-stage-addr ${LOCAL_IP}:${RETURN_PORT}"
+        # Last stage: bind PUSH socket for return path
+        RETURN_BIND_PORT=$((BASE_PORT + NUM_STAGES))
+        CMD="$CMD --pipeline-local-bind-port $RETURN_BIND_PORT"
+    fi
+    
+    if [ "$IS_FIRST" = "true" ] && [ "$IS_LAST" = "false" ]; then
+        # Stage 0: connect PULL socket to last stage's return Service
+        RETURN_BIND_PORT=$((BASE_PORT + NUM_STAGES))
+        CMD="$CMD --pipeline-prev-stage-addr ${LOCAL_IP}:${RETURN_BIND_PORT}"
     fi
     
     # Add tensor parallel size if needed (default to 1)
@@ -196,19 +201,21 @@ for stage_idx in $(seq 0 $((NUM_STAGES - 1))); do
     echo "  Model: $STAGE_DIR"
     echo "  Log: $LOG_FILE"
     echo "  GPU: $STAGE_GPU"
-    if [ "$IS_FIRST" = "false" ]; then
-        echo "  Forward Listen Port: $LISTEN_PORT (receives from stage $((stage_idx - 1)))"
-    fi
-    if [ "$IS_FIRST" = "true" ] && [ "$IS_LAST" = "false" ]; then
-        RETURN_PORT=$((BASE_PORT + NUM_STAGES))
-        echo "  Return Listen Port: $RETURN_PORT (receives final results from last stage)"
-    fi
     if [ "$IS_LAST" = "false" ]; then
-        echo "  Next Stage: ${LOCAL_IP}:${NEXT_PORT}"
+        BIND_PORT=$((BASE_PORT + stage_idx))
+        echo "  Forward Bind Port: $BIND_PORT (PUSH socket binds, allows next stage to connect)"
+    fi
+    if [ "$IS_FIRST" = "false" ]; then
+        PREV_BIND_PORT=$((BASE_PORT + stage_idx - 1))
+        echo "  Previous Stage Service: ${LOCAL_IP}:${PREV_BIND_PORT} (PULL socket connects)"
     fi
     if [ "$IS_LAST" = "true" ]; then
-        RETURN_PORT=$((BASE_PORT + NUM_STAGES))
-        echo "  Return Address: ${LOCAL_IP}:${RETURN_PORT} (sends final results to stage 0)"
+        RETURN_BIND_PORT=$((BASE_PORT + NUM_STAGES))
+        echo "  Return Bind Port: $RETURN_BIND_PORT (PUSH socket binds for return path)"
+    fi
+    if [ "$IS_FIRST" = "true" ] && [ "$IS_LAST" = "false" ]; then
+        RETURN_BIND_PORT=$((BASE_PORT + NUM_STAGES))
+        echo "  Return Service: ${LOCAL_IP}:${RETURN_BIND_PORT} (PULL socket connects to last stage)"
     fi
     if [ "$IS_FIRST" = "true" ]; then
         echo "  API Port: $API_PORT"
@@ -248,15 +255,17 @@ echo ""
 echo "API endpoint (for testing):"
 echo "  Stage 0: http://localhost:8000"
 echo ""
-echo "ZeroMQ communication ports:"
-echo "Forward path (stage_k -> stage_{k+1}):"
+echo "ZeroMQ communication ports (bind mode):"
+echo "Forward path (stage_k binds PUSH, stage_{k+1} connects PULL):"
 for stage_idx in $(seq 0 $((NUM_STAGES - 2))); do
-    PORT=$((BASE_PORT + stage_idx))
-    echo "  Stage $stage_idx -> Stage $((stage_idx + 1)): ${LOCAL_IP}:${PORT}"
+    BIND_PORT=$((BASE_PORT + stage_idx))
+    echo "  Stage $stage_idx binds PUSH on port $BIND_PORT"
+    echo "  Stage $((stage_idx + 1)) connects PULL to ${LOCAL_IP}:${BIND_PORT}"
 done
-RETURN_PORT=$((BASE_PORT + NUM_STAGES))
-echo "Return path (last stage -> stage 0):"
-echo "  Stage $((NUM_STAGES - 1)) -> Stage 0: ${LOCAL_IP}:${RETURN_PORT}"
+RETURN_BIND_PORT=$((BASE_PORT + NUM_STAGES))
+echo "Return path (last stage binds PUSH, stage 0 connects PULL):"
+echo "  Stage $((NUM_STAGES - 1)) binds PUSH on port $RETURN_BIND_PORT"
+echo "  Stage 0 connects PULL to ${LOCAL_IP}:${RETURN_BIND_PORT}"
 echo ""
 echo "To view logs:"
 echo "  tail -f $LOG_DIR/stage_0.log"

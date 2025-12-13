@@ -1086,6 +1086,7 @@ def init_external_pp_group(
     local_listen_port: int | None = None,
     next_stage_addr: str | None = None,
     prev_stage_addr: str | None = None,
+    local_bind_port: int | None = None,
     device: str = "cuda",
 ) -> GroupCoordinator:
     """Initialize PP group for external stage mode using ZeroMQ.
@@ -1192,6 +1193,7 @@ def init_external_pp_group(
         local_listen_port=local_listen_port,
         next_stage_addr=next_stage_addr,
         prev_stage_addr=prev_stage_addr,
+        local_bind_port=local_bind_port,
         device=device,
     )
     pp_group.zeromq_comm = zeromq_comm
@@ -1564,6 +1566,7 @@ def initialize_model_parallel(
             local_listen_port=parallel_config.pipeline_local_listen_port,
             next_stage_addr=parallel_config.pipeline_next_stage_addr,
             prev_stage_addr=parallel_config.pipeline_prev_stage_addr,
+            local_bind_port=parallel_config.pipeline_local_bind_port,
             device=device,
         )
     else:
