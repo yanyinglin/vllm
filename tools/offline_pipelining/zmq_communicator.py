@@ -67,7 +67,7 @@ class ZeroMQCommunicator:
         num_stages: int,
         zmq_ports: list[int],
         device: str = "cpu",
-        timeout_ms: int = 30000,
+        timeout_ms: int = -1,  # -1 means no timeout, keep long connection alive
     ):
         """初始化ZeroMQ通信器
         
@@ -120,7 +120,8 @@ class ZeroMQCommunicator:
             prev_port = self.zmq_ports[self.stage_idx - 1]
             self.pull_socket.connect(f"tcp://localhost:{prev_port}")
             # 设置接收超时
-            self.pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            # No timeout: keep long connection alive (RCVTIMEO not set, will block until data arrives)
+            # self.pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
             logger.info(
                 f"Stage {self.stage_idx} connected PULL socket to port {prev_port}"
             )
@@ -138,7 +139,8 @@ class ZeroMQCommunicator:
             # 第一个stage需要接收token ID
             self.backward_pull_socket = self.context.socket(zmq.PULL)
             self.backward_pull_socket.connect(f"tcp://localhost:{backward_port}")
-            self.backward_pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            # No timeout: keep long connection alive (RCVTIMEO not set, will block until data arrives)
+            # self.backward_pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
             logger.info(f"Stage {self.stage_idx} connected backward PULL socket to port {backward_port}")
     
     def send_tensor_dict(

@@ -19,34 +19,47 @@ Starting from commit `cbfc1eb`, we migrated pipeline parallelism data transmissi
 
 #### Tools Directory
 
-1. **`tools/offline_pipelining/zmq_communicator.py`** (NEW)
+1. **`tools/offline_pipelining/zmq_communicator.py`**
    - Implements `ZeroMQCommunicator` class
    - Provides `send_tensor_dict()` and `recv_tensor_dict()` interfaces compatible with PyTorch distributed API
    - Uses ZeroMQ PUSH/PULL sockets for unidirectional communication between stages
    - Supports bidirectional communication for autoregressive generation (token ID feedback)
 
-2. **`tools/offline_pipelining/test_pipeline.py`** (NEW)
+2. **`tools/offline_pipelining/test_pipeline.py`**
    - Implements `PipelineStage` and `ZeroMQPipeline` classes
    - Uses `ZeroMQCommunicator` for inter-stage communication
    - Supports multiprocess pipeline execution
 
-3. **`tools/offline_pipelining/serve_pipeline.py`** (NEW)
+3. **`tools/offline_pipelining/serve_pipeline.py`**
    - Pipeline export tool for splitting models into stages
    - Exports each stage as HuggingFace format
 
-4. **`tools/offline_pipelining/test_model_zeromq.py`** (NEW)
+4. **`tools/offline_pipelining/test_model_zeromq.py`**
    - Test tool for validating pipeline stages with vLLM engine
 
-5. **`tools/offline_pipelining/http_index.py`** (NEW)
+5. **`tools/offline_pipelining/http_index.py`**
    - HTTP entry point for ZeroMQ pipeline parallelism
    - Launches all pipeline stages using external pipeline mode
    - Exposes HTTP server that forwards inference requests to stage 0
    - Handles process lifecycle and cleanup
    - Provides health check and pipeline status endpoints
 
+6. **`tools/offline_pipelining/run_from_full_model.sh`** ⭐ NEW
+   - Automated script for running pipeline parallelism from complete model (no pre-splitting)
+   - Auto-calculates layer ranges for each stage
+   - Launches all stages with correct ZeroMQ configuration
+   - Demonstrates dynamic loading with `--pipeline-layer-range` parameter
+
+7. **`tools/offline_pipelining/validate_layer_ranges.py`** ⭐ NEW
+   - Validation tool for pipeline layer range configuration
+   - Checks for overlaps, gaps, and invalid ranges
+   - Supports auto-calculation from model config
+   - Helps prevent configuration errors before deployment
+
 #### Core vLLM Files (Modified in commit `83e77c4cb`)
 
 **Note**: These modifications are required for the "External Pipeline Mode" feature.
+
 
 1. **`vllm/v1/worker/gpu_model_runner.py`** (MODIFIED)
    - Added `execute_external_pipeline_step()` method for external PP stages
@@ -148,7 +161,14 @@ This approach integrates ZeroMQ support directly into vLLM core:
 
 ## Usage
 
-### Export Pipeline Stages
+vLLM supports two approaches for pipeline parallelism with ZeroMQ:
+
+1. **Pre-Split Models** (Recommended for production): Export model stages once, then use them multiple times
+2. **Dynamic Loading from Full Model** (Recommended for development): Run directly from complete model without pre-splitting
+
+### Approach 1: Pre-Split Models (Traditional)
+
+#### Step 1: Export Pipeline Stages
 
 ```bash
 python tools/offline_pipelining/serve_pipeline.py \
@@ -157,7 +177,124 @@ python tools/offline_pipelining/serve_pipeline.py \
     --output-dir /nfs_ssd/yanying/models/pipeline/Meta-Llama-3-8B/inference
 ```
 
-### Run Pipeline with ZeroMQ
+**Pros**:
+- ✅ Faster startup time (5-10s faster per stage)
+- ✅ Minimal disk I/O during initialization
+- ✅ Ideal for production deployments with fixed configurations
+
+**Cons**:
+- ❌ Requires pre-processing step
+- ❌ Additional disk space (duplicate of original model)
+- ❌ Need to re-export if changing number of stages
+
+#### Step 2: Run Pre-Split Pipeline Stages
+
+See sections below for running options.
+
+### Approach 2: Dynamic Loading from Full Model (New)
+
+**No pre-splitting required!** Each stage loads only its assigned layers from the complete model.
+
+#### Quick Start
+
+```bash
+# Edit the script to set your model path
+nano tools/offline_pipelining/run_from_full_model.sh
+
+# Set FULL_MODEL_PATH to your complete model
+FULL_MODEL_PATH="/path/to/Llama-3-8B"
+
+# Run the script
+bash tools/offline_pipelining/run_from_full_model.sh
+```
+
+The script will:
+- ✅ Automatically calculate layer ranges for each stage
+- ✅ Launch all pipeline stages with correct ZeroMQ configuration
+- ✅ Each stage loads only its assigned layers (memory-efficient)
+- ✅ Provide health checks and test commands
+
+**Pros**:
+- ✅ No pre-processing required
+- ✅ No additional disk space needed
+- ✅ Easy to experiment with different pipeline configurations
+- ✅ Memory-efficient: Only loads needed layers per stage (using lazy loading)
+
+**Cons**:
+- ⚠️ Slightly slower startup (~5-10s extra per stage) due to scanning weight files
+- ⚠️ All stages need access to the same model directory (shared storage or NFS)
+
+#### Manual Launch Example
+
+```bash
+# Stage 0 (layers 0-8, first stage with API)
+CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/Llama-3-8B \
+    --pipeline-stage-mode external \
+    --pipeline-stage-idx 0 \
+    --pipeline-total-stages 4 \
+    --pipeline-layer-range "0-8" \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-addr 127.0.0.1:15554 \
+    --tensor-parallel-size 1 \
+    --port 8000
+
+# Stage 1 (layers 8-16, middle stage)
+CUDA_VISIBLE_DEVICES=1 vllm serve /path/to/Llama-3-8B \
+    --pipeline-stage-mode external \
+    --pipeline-stage-idx 1 \
+    --pipeline-total-stages 4 \
+    --pipeline-layer-range "8-16" \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --tensor-parallel-size 1 \
+    --external-pp-worker
+
+# Stage 2 (layers 16-24, middle stage)
+CUDA_VISIBLE_DEVICES=2 vllm serve /path/to/Llama-3-8B \
+    --pipeline-stage-mode external \
+    --pipeline-stage-idx 2 \
+    --pipeline-total-stages 4 \
+    --pipeline-layer-range "16-24" \
+    --pipeline-local-bind-port 15550 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --tensor-parallel-size 1 \
+    --external-pp-worker
+
+# Stage 3 (layers 24-32, last stage)
+CUDA_VISIBLE_DEVICES=3 vllm serve /path/to/Llama-3-8B \
+    --pipeline-stage-mode external \
+    --pipeline-stage-idx 3 \
+    --pipeline-total-stages 4 \
+    --pipeline-layer-range "24-32" \
+    --pipeline-local-bind-port 15554 \
+    --pipeline-prev-stage-service-addr 127.0.0.1:15550 \
+    --tensor-parallel-size 1 \
+    --external-pp-worker
+```
+
+#### How Dynamic Loading Works
+
+**Memory-Efficient Lazy Loading**:
+1. ✅ Opens all weight files (`model-00001-of-00004.safetensors`, etc.)
+2. ✅ Reads only metadata (parameter names and locations) from all files
+3. ✅ **Only loads assigned layers into memory** (e.g., layers 8-16 for stage 1)
+4. ✅ Skips other layers using `PPMissingLayer` placeholders (zero memory cost)
+5. ✅ Uses memory-mapped files for efficient access
+
+**Example** (32-layer model, 4 stages):
+- Stage 1 loads layers 8-16: ~2GB memory (not 8GB for full model!)
+- Layers 0-7: Skipped (PPMissingLayer, no memory used)
+- Layers 16-31: Skipped (PPMissingLayer, no memory used)
+
+**Technical Details**:
+- Uses safetensors' `safe_open()` for memory-mapped access
+- Parameter filtering via `is_pp_missing_parameter()` in vLLM core
+- Layer indices preserved (no renumbering needed)
+- Same final memory footprint as pre-split models
+
+### Run Pre-Split Pipeline with ZeroMQ (Simple Test)
+
+For quick testing of pre-split models:
 
 ```bash
 python tools/offline_pipelining/test_pipeline.py \
@@ -168,7 +305,52 @@ python tools/offline_pipelining/test_pipeline.py \
     --multiprocess
 ```
 
-### Run Pipeline with External Pipeline Mode (ZeroMQ - Core Integration)
+### Comparison: Pre-Split vs Dynamic Loading
+
+| Feature | Pre-Split Models | Dynamic Loading (Full Model) |
+|---------|-----------------|------------------------------|
+| **Setup Required** | ✅ Run `serve_pipeline.py` once | ❌ None, use model directly |
+| **Disk Space** | ❌ ~2x (original + split) | ✅ 1x (original only) |
+| **Startup Time** | ✅ Fast (~10-15s) | ⚠️ Slightly slower (~15-25s) |
+| **Memory Usage** | ✅ Minimal per stage | ✅ Minimal per stage (same) |
+| **Configuration Flexibility** | ❌ Must re-export to change | ✅ Just change layer ranges |
+| **Best For** | Production deployments | Development & prototyping |
+| **Network Storage** | ✅ Minimal I/O | ⚠️ More file opens (metadata) |
+| **Recommended When** | Fixed config, performance critical | Experimenting, shared storage |
+
+**Bottom Line**: 
+- Use **pre-split** for production (faster, battle-tested)
+- Use **dynamic loading** for development and experimentation (flexible, no pre-processing)
+
+### Validate Layer Range Configuration
+
+Before launching pipeline stages, validate your layer range configuration:
+
+```bash
+# Validate explicit ranges
+python tools/offline_pipelining/validate_layer_ranges.py \
+    --total-layers 32 \
+    --ranges "0-8" "8-16" "16-24" "24-32"
+
+# Auto-calculate and validate from model
+python tools/offline_pipelining/validate_layer_ranges.py \
+    --model /path/to/Llama-3-8B \
+    --num-stages 4
+
+# Validate custom ranges against model
+python tools/offline_pipelining/validate_layer_ranges.py \
+    --model /path/to/Llama-3-8B \
+    --ranges "0-10" "10-20" "20-32"
+```
+
+The validator checks:
+- ✅ No overlapping layers between stages
+- ✅ All layers covered exactly once (no gaps)
+- ✅ Valid range formats and indices
+- ✅ Ranges match total layer count
+
+### Run Pipeline with External Pipeline Mode (Production Deployment)
+
 
 For production use with external pipeline mode, you can use either:
 

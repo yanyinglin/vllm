@@ -40,7 +40,7 @@ class ZeroMQPPCommunicator:
         prev_stage_addr: str | None = None,  # "ip:port" format for return PULL to connect (bind mode)
         local_bind_port: int | None = None,  # Port for PUSH socket to bind (bind mode)
         device: str = "cuda",
-        timeout_ms: int = 300000,  # Default 5 minutes for external PP (stages may wait for requests)
+        timeout_ms: int = -1,  # -1 means no timeout, keep long connection alive
     ):
         """Initialize ZeroMQ communicator.
         
@@ -105,7 +105,7 @@ class ZeroMQPPCommunicator:
             self.pull_socket.setsockopt(zmq.LINGER, 1000)
             # Connect to previous stage's PUSH Service (bind mode)
             self.pull_socket.connect(f"tcp://{prev_stage_service_addr}")
-            self.pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            # No timeout: keep long connection alive (RCVTIMEO not set, will block until data arrives)
             logger.info(
                 f"Stage {self.stage_idx} connecting PULL socket to previous stage's PUSH Service {prev_stage_service_addr}"
             )
@@ -188,7 +188,7 @@ class ZeroMQPPCommunicator:
             # Set LINGER to ensure messages are not lost on close
             self.return_pull_socket.setsockopt(zmq.LINGER, 1000)
             self.return_pull_socket.connect(f"tcp://{prev_stage_addr}")
-            self.return_pull_socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            # No timeout: keep long connection alive (RCVTIMEO not set, will block until data arrives)
             logger.info(
                 f"Stage {self.stage_idx} connecting RETURN PULL socket to {prev_stage_addr} "
                 f"to receive final results from last stage (bind mode)"
